@@ -56,7 +56,7 @@ model_mappings:
     Gemma-4-31B:                         "not_available"
   Cerebras:
     Llama-4-Maverick-17B-128E-Instruct: "not_available"
-    Gemma-4-31B:                         "not_available"
+    Gemma-4-31B:                         "gemma-4-31b"
   Together:
     Llama-4-Maverick-17B-128E-Instruct: "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"
     Gemma-4-31B:                         "google/gemma-4-31B-it"
