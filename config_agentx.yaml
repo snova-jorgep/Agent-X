@@ -23,7 +23,7 @@ agentx_options:
 
   judge: gpt          # gpt | qwen
   run_eval: true      # false = infer only (no judge key needed)
-  judge_python: "venv_agentx_judge/bin/python"  # judge needs openai==0.28.0, isolated venv
+  judge_python: ".venv_agentx_judge/bin/python"  # judge needs openai==0.28.0, isolated venv
 
 max_parallel: 1       # OpenCompass parallelizes across models internally
 
