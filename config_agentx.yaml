@@ -18,10 +18,12 @@ agentx_options:
 
   max_num_workers: 8
   limit: 5            # 0 = full 828 tasks; small N = smoke test
+  debug: false        # true = OpenCompass sequential in-process (aborts batch on 1st model error); false = isolated tasks, resilient
+  request_timeout: 300  # per-request seconds; a stalled provider errors+retries instead of hanging the run forever
 
   judge: gpt          # gpt | qwen
   run_eval: true      # false = infer only (no judge key needed)
-  judge_python: "../venv_agentx_judge/bin/python"  # judge needs openai==0.28.0, isolated venv
+  judge_python: "venv_agentx_judge/bin/python"  # judge needs openai==0.28.0, isolated venv
 
 max_parallel: 1       # OpenCompass parallelizes across models internally
 
@@ -46,20 +48,20 @@ provider_api_keys:
 # the other suites so the `model` column joins in Athena/Grafana. "not_available" = skip.
 model_mappings:
   SambaNova:
-    Llama-4-Maverick-17B-128E-Instruct: "Llama-4-Maverick-17B-128E-Instruct"
+    #Llama-4-Maverick-17B-128E-Instruct: "Llama-4-Maverick-17B-128E-Instruct"
     Gemma-4-31B:                         "gemma-4-31B-it"
   Fireworks:
-    Llama-4-Maverick-17B-128E-Instruct: "accounts/fireworks/models/llama4-maverick-instruct-basic"
+  #   Llama-4-Maverick-17B-128E-Instruct: "accounts/fireworks/models/llama4-maverick-instruct-basic"
     Gemma-4-31B:                         "accounts/fireworks/models/gemma-4-31b-it"
   Groq:
-    Llama-4-Maverick-17B-128E-Instruct: "meta-llama/llama-4-maverick-17b-128e-instruct"
+  #   Llama-4-Maverick-17B-128E-Instruct: "meta-llama/llama-4-maverick-17b-128e-instruct"
     Gemma-4-31B:                         "not_available"
   Cerebras:
-    Llama-4-Maverick-17B-128E-Instruct: "not_available"
+  #   Llama-4-Maverick-17B-128E-Instruct: "not_available"
     Gemma-4-31B:                         "gemma-4-31b"
   Together:
-    Llama-4-Maverick-17B-128E-Instruct: "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"
+  #   Llama-4-Maverick-17B-128E-Instruct: "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"
     Gemma-4-31B:                         "google/gemma-4-31B-it"
   Novita:
-    Llama-4-Maverick-17B-128E-Instruct: "meta-llama/llama-4-maverick-17b-128e-instruct-fp8"
+  #   Llama-4-Maverick-17B-128E-Instruct: "meta-llama/llama-4-maverick-17b-128e-instruct-fp8"
     Gemma-4-31B:                         "google/gemma-4-31b-it"

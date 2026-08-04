@@ -147,6 +147,7 @@ def build_models(cfg):
                 f"            openai_api_base={base_url!r},\n"
                 f"            query_per_second={int(opts.get('query_per_second', 1))},\n"
                 f"            max_seq_len={int(opts.get('max_seq_len', 4096))},\n"
+                f"            timeout={int(opts.get('request_timeout', 300))},\n"
                 "            stop='<|im_end|>',\n"
                 "        ),\n"
                 f"        tool_server={opts['tool_server']!r},\n"
@@ -180,6 +181,12 @@ def render_eval_config(model_dicts):
         "    runner=dict(type=LocalRunner, task=dict(type=OpenICLInferTask)),\n"
         ")\n"
     )
+
+
+def mask_config_keys(text):
+    """Redact API keys (`key='...'`) for safe display. The real value is only
+    ever written to the on-disk config, never printed."""
+    return re.sub(r"key='[^']*'", "key='****'", text)
 
 
 def truncate_dataset(dataset_path, limit):
@@ -351,8 +358,8 @@ def main():
         print(f"\n[DRY-RUN] Would back up {EVAL_CONFIG} -> {backup}")
         if limit and limit > 0:
             print(f"[DRY-RUN] Would truncate {dataset_path} to first {limit} task(s)")
-        print("[DRY-RUN] Would write generated config:\n")
-        print(render_eval_config(model_dicts))
+        print("[DRY-RUN] Would write generated config (API keys masked):\n")
+        print(mask_config_keys(render_eval_config(model_dicts)))
     else:
         shutil.copy2(EVAL_CONFIG, backup)
         EVAL_CONFIG.write_text(render_eval_config(model_dicts))
@@ -361,11 +368,17 @@ def main():
 
     try:
         # --- Inference (OpenCompass) --------------------------------------
+        # Without --debug, OpenCompass runs each model as an isolated task and
+        # continues past failures (one provider's error won't abort the batch).
+        # --debug runs sequentially in-process and raises on the first error —
+        # useful for diagnosing a single model, bad for multi-provider runs.
         infer_cmd = [
             "python", "run.py", "configs/eval_gta_bench.py",
             "--max-num-workers", str(opts.get("max_num_workers", 8)),
-            "--debug", "--mode", "infer",
+            "--mode", "infer",
         ]
+        if opts.get("debug", False):
+            infer_cmd.append("--debug")
         run_command(infer_cmd, output_base / "infer.log",
                     cwd=OPENCOMPASS_DIR, dry_run=dry_run)
 
