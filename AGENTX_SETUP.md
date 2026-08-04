@@ -34,15 +34,71 @@ cd ../opencompass && pip install -e .
 We do **NOT** need LMDeploy — models under test are hosted provider APIs
 (OpenAI-compatible), not locally-served HF weights.
 
+## 1b. Local setup without conda (macOS / uv)
+
+Verified on macOS (Apple Silicon). Uses `uv` instead of conda — three venvs, all
+under `tests/agentx_snova/`. Pins live in [requirements-local/](requirements-local/).
+
+```bash
+cd tests/agentx_snova
+uv python install 3.10 3.11          # fetch interpreters (no conda/pyenv)
+
+# --- Env 1: tool server (the only env with the heavy vision deps) ---
+uv venv --python 3.11 .venv_agentlego
+source .venv_agentlego/bin/activate
+cd agentlego
+uv pip install .                     # NON-editable: agentlego pins setuptools<64, so `-e` fails (no PEP660)
+uv pip install -r requirements/optional.txt   # torch + easyocr (arm64 wheels OK)
+uv pip install -r requirements/server.txt     # fastapi/typer/uvicorn/makefun — needed to run the server
+deactivate; cd ..
+# NOTE: skip requirements_all.txt (frozen x86-Linux dump: mkl-*/triton have no arm64 wheels).
+# Skip mim/mmcv/mmpretrain too — only needed for VQA tools; OCR uses easyocr. See the tools caveat in §4.
+
+# --- Env 2: inference ---
+uv venv --python 3.10 .venv_opencompass
+source .venv_opencompass/bin/activate
+uv pip install ./agentlego ./opencompass       # both NON-editable
+# (download the dataset now — see §2 — then apply the local pins LAST:)
+uv pip install -r requirements-local/inference.txt
+deactivate
+
+# --- Env 3: judge (openai 0.28, isolated) ---
+uv venv --python 3.10 .venv_agentx_judge
+source .venv_agentx_judge/bin/activate
+uv pip install -r requirements-local/judge.txt
+deactivate
+```
+
+Why `requirements-local/inference.txt` is needed (and installed **last**): `lagent`
+2.2 + the OpenCompass import chain pull transitive versions that break against
+current PyPI. The file pins `phx-class-registry==4.1.0` (5.x moved `AutoRegister`),
+`griffe<1.0` (removed `griffe.enumerations`), `sentence-transformers>=2.7`
+(2.2.x imports the removed `cached_download`), `huggingface-hub<1.0` (transformers
+requires it; the dataset download bumps hub past it), plus `importlib_metadata`
+and the wrapper deps `boto3`/`pyyaml`/`python-dotenv`.
+
 ## 2. Dataset
 
-Download from https://huggingface.co/datasets/Tajamul21/Agent-X into:
+Download from https://huggingface.co/datasets/Tajamul21/Agent-X into
+`opencompass/data/agentx_dataset/`. Three JSON files are needed:
 
 ```
 tests/agentx_snova/opencompass/data/agentx_dataset/
-├── dataset.json      # ground truth (judge --gt_data_path)
+├── dataset.json      # OpenCompass inference input (GTABenchDataset.load reads this)
+├── data.json         # judge ground truth (--gt_data_path)
 ├── toolmeta.json
-└── image/            # all images/videos here
+└── image/  ->  files/   # symlink: dataset.json references image/AgentX_*.jpg
+```
+
+The HF repo stores the images in a `files/` folder, but `dataset.json` references
+them as `image/…`. Download, then symlink `image → files`:
+
+```bash
+cd tests/agentx_snova
+source .venv_opencompass/bin/activate
+uv pip install -U "huggingface-hub[cli]>=0.34,<1.0"   # constrained so it doesn't clobber transformers
+hf download Tajamul21/Agent-X --repo-type dataset --local-dir opencompass/data/agentx_dataset
+ln -s files opencompass/data/agentx_dataset/image     # so image/AgentX_*.jpg resolves
 ```
 
 ## 3. API keys — `tests/agentx_snova/.env`
@@ -63,173 +119,91 @@ subset that avoids Serper/Mathpix.
 ## 4. Start the AgentLego tool server (env: agentlego)
 
 ```bash
-conda activate agentlego
-export SERPER_API_KEY=... MATHPIX_APP_ID=... MATHPIX_APP_KEY=...
+conda activate agentlego                 # or: source .venv_agentlego/bin/activate  (local/uv)
+set -a; source ../.env; set +a           # exports SERPER/MATHPIX if any tool needs them
 cd tests/agentx_snova/agentlego
 agentlego-server start --port 16181 --device cpu --no-setup --extra ./benchmark.py OCR --host 0.0.0.0
 ```
 
 Leave it running (use tmux). Matches `agentx_options.tool_server` in the config.
 
+> **Local/uv tools caveat:** the uv setup (§1b) installs only the OCR tool path
+> (easyocr), not the `mmcv`/`mmpretrain` stack. So the server exposes **OCR** (+ the
+> agent's `finish`) but not VQA tools like `ImageDescription`. Inference still runs
+> and produces full traces, but tool-dependent scores (`tool_accuracy`,
+> `toolset_accuracy`) will be low — fine for a plumbing smoke test. For meaningful
+> scores install the full tool stack (`mim install mmengine mmcv==2.1.0` + mmpretrain).
+
 ## 5. Run (env: opencompass)
 
 ```bash
-conda activate opencompass
+conda activate opencompass       # or: source .venv_opencompass/bin/activate  (local/uv)
 cd tests/agentx_snova
-python run_agentx.py --dry-run   # prints injected config + commands, runs nothing
+python run_agentx.py --dry-run   # prints injected config + commands (API keys masked), runs nothing
 python run_agentx.py             # infer -> judge -> CSV -> S3
 ```
 
 Outputs: `logs/agentx/<ts>/{provider}/{model}/{preds.json,scores.json}` and
 `results_<ts>.csv`, uploaded to `s3://.../fc-so-testing-suite/agentx_snova/<ts>/`.
 
-## 6. Judge-free run on a limited number of records
-
-The cheapest useful run: N tasks, no judge, no OpenAI key. Everything below is
-already the default in [config_agentx.yaml](config_agentx.yaml).
-
-```yaml
-agentx_options:
-  limit: 5            # first N tasks of dataset.json (0 = all 828)
-  run_eval: false     # skip the judge entirely
-  stop: ""            # SambaNova-hosted gemma/llama: no ChatML stop token
-```
-
-`limit` truncates `dataset.json` in place for the run and restores it from
-`dataset.json.suite-bak` in a `finally` block, so an interrupted run leaves the
-full dataset behind. Keys are taken in order (`"0"`..`"N-1"`) and align with
-`data.json`, so the same subset can be judged later without re-running inference.
-
-Steps (from the repo root, on a node that can reach the tool server):
+`run_agentx.py` runs the whole flow. To re-run **only** the judge on an existing
+`preds.json` (no re-inference), invoke it directly — but export the env first,
+since a manual shell won't have `OPENAI_API_KEY` (the runner's `load_env()` does
+this automatically in the normal flow):
 
 ```bash
-CONDA=/import/snvm-sc-scratch2/rodrigom/miniforge3
-source $CONDA/etc/profile.d/conda.sh
-
-# 1. tool server — leave running in its own tmux window
-conda activate agentlego
-cd tests/agentx_snova/agentlego
-export $(grep -E '^(SERPER|MATHPIX)' ../.env | xargs)
-agentlego-server start --port 16181 --device cpu --no-setup --extra ./benchmark.py \
-    Calculator OCR Plot Solver GoogleSearch MathOCR --host 0.0.0.0
-
-# 2. confirm it is up — the run dies at model-build time if this 404s/refuses
-curl -s localhost:16181/openapi.json | head -c 200
-
-# 3. inference only
-conda activate opencompass
-cd tests/agentx_snova
-python run_agentx.py --dry-run    # check the injected model dict
-python run_agentx.py
+set -a; source .env; set +a
+venv_agentx_judge/bin/python evaluation/run_eval_gpt_as_judge.py \
+  --save_path <model_dir>/scores.json \
+  --gt_data_path opencompass/data/agentx_dataset/data.json \
+  --pred_path <model_dir>/preds.json
+python agentx_report.py logs/agentx/<ts>          # aggregate scores.json -> results_<ts>.csv
 ```
 
-Result: `logs/agentx/<ts>/{provider}/{model}/preds.json` plus a `[SUMMARY]` line
-reporting how many of the N tasks produced a final answer, used tools, or hit
-step errors. **No CSV and no S3 report** — `agentx_report.py` averages judge
-metrics, so it only runs when `run_eval: true`.
+> Without AWS creds in `.env`, S3 uploads `[WARN]`-skip and the CSV stays local —
+> expected for a local run.
 
-## 7. Turning the judge on
+## Output & metrics
 
-Verified working end-to-end against the existing `venv_agentx_judge` — no code
-changes needed. To score a full run:
+Each of the 12 metrics is a separate GPT/Qwen-judge call returning
+`{'Score': <0–1>, 'Justification': ...}` per task. `agentx_report.py` parses the
+`Score`, **averages each metric across all tasks**, and writes one CSV row per
+model: `date, provider, model, num_tasks` + the 12 averaged scores (each 0–1).
+The CSV feeds the `agentx_results` Athena table; the unified Grafana view surfaces
+**`goal_accuracy`** as the cross-benchmark headline (the other 11 stay queryable
+in `agentx_results`).
 
-```yaml
-agentx_options:
-  run_eval: true
-  judge: gpt
-  judge_python: "venv_agentx_judge/bin/python"   # openai==0.28.0 lives here
-```
+| Metric | Meaning (all 0–1) |
+|--------|-------------------|
+| **goal_accuracy** ⭐ | Final-answer correctness — cosine similarity to GT (or 0/1 for exact-answer types). **Headline metric.** |
+| grounding_accuracy | Per step: reasoning grounded in the actual visual/tool evidence (avg per-step) |
+| precision_score | Binary 0/1 — precision of the reasoning vs GT |
+| tool_accuracy | Correct tools called vs GT `tool_metadata` |
+| toolset_accuracy | F1 over the *set* of tools used vs GT |
+| faithfulness_accuracy | Reasoning trace logically faithful to the GT plan |
+| step_score | Quality of each reasoning step (avg per-step) |
+| context_score | Each step uses available context appropriately (avg per-step) |
+| factual_precision | Factual correctness of claims in the reasoning vs GT |
+| semantic_accuracy | Semantic match of reasoning + final answer to GT |
+| reward_score | Self-correction ability — recognizing and fixing its own mistakes |
+| clarity_penalty | Penalty for unclear/verbose reasoning (**higher = worse**, unlike the rest) |
 
-and in `.env`, uncomment the AWS block (otherwise the CSV is written locally and
-the S3 upload logs `[WARN] Upload failed`, so nothing reaches Athena/Grafana):
+Metric definitions live in `evaluation/multiagent_evaluation.py` (`get_*` fns).
 
-```
-AWS_REGION=... AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_S3_BUCKET_NAME=...
-```
-
-The judge env is separate on purpose: `evaluation/multiagent_evaluation.py` uses
-`openai.ChatCompletion.create`, removed in openai 1.x, which the inference env
-needs. `run_agentx.py` spawns it as a subprocess so the keys are inherited from
-the already-loaded `.env` — the judge env itself has no `python-dotenv`.
-
-It lives at `tests/agentx_snova/venv_agentx_judge/` (a conda **prefix** env, not
-a `python -m venv`, ~243MB) and is git-ignored via this submodule's own
-`.gitignore`. To rebuild it from scratch:
-
-```bash
-conda create -p tests/agentx_snova/venv_agentx_judge python=3.10 -y
-tests/agentx_snova/venv_agentx_judge/bin/pip install 'openai==0.28.0' tqdm
-```
-
-Conda prefix envs are not relocatable: `bin/python` resolves its prefix from its
-own location and survives a move, but the ~15 shebang'd scripts in `bin/` (`pip`,
-`openai`, `wheel`, `*-config`, ...) hardcode the old absolute path. If you move
-the directory, rewrite them and update the conda registry:
-
-```bash
-OLD=<old abs path>; NEW=<new abs path>
-grep -rl "$OLD" "$NEW/bin" | xargs sed -i "s|$OLD|$NEW|g"
-sed -i "s|^$OLD\$|$NEW|" ~/.conda/environments.txt
-```
-
-Judge model / endpoint are env-controlled: `AGENTX_JUDGE_MODEL` (default
-`gpt-4o`) and `AGENTX_JUDGE_API_BASE` (unset ⇒ `api.openai.com`; set it without
-the `/chat/completions` suffix to judge on any OpenAI-compatible provider).
-
-To score an already-completed infer-only run without re-running inference:
-
-```bash
-set -a; . ./.env; set +a
-cd evaluation && ../venv_agentx_judge/bin/python run_eval_gpt_as_judge.py \
-    --pred_path  ../logs/agentx/<ts>/SambaNova/<model>/preds.json \
-    --gt_data_path ../opencompass/data/agentx_dataset/data.json \
-    --save_path  ../logs/agentx/<ts>/SambaNova/<model>/scores.json
-cd .. && python agentx_report.py logs/agentx/<ts> fc-so-testing-suite/agentx_snova/<ts>
-```
-
-### Judge cost, runtime, and failure modes
-
-* **12 sequential gpt-4o calls per task**, no batching, no concurrency: ~1.7k
-  input + ~200 output tokens each, so roughly **$0.07/task** — a few cents for a
-  5-task smoke test, order **$50–60 and many hours for all 828**.
-* **No retry / rate-limit handling.** A single failed call is swallowed by a
-  broad `except Exception`, leaving that task's 12 metrics `None`.
-  `agentx_report.py` excludes `None` from each metric's denominator, so a
-  partially rate-limited run silently averages over fewer tasks than
-  `num_tasks` claims. Check `judge.log` for tracebacks before trusting a row.
-* **Metric output is free-form**, not numeric: each metric comes back as a
-  string containing a Python dict, sometimes inside a ```` ```python ```` fence,
-  with `Score` as `'0.25'`, `0.0`, or an apostrophe-broken literal.
-  `agentx_report._extract_score` handles all of these (literal_eval → bare float
-  → regex fallback); verified all 12 parse on real gpt-4o output.
-* **8 of the 12 metrics score the reasoning *trace*, not the answer.** A model
-  that answers directly without tool calls scores ~0 on grounding, precision,
-  tool/toolset accuracy, faithfulness, context and reward even when its final
-  answer is right. Confirm the `[SUMMARY]` line shows real tool use before
-  reading anything into low scores.
-
-### Tool fidelity vs. hardware
-
-`tool_meta` registers a `DummyTool` (returns the literal `'Dummy Result'`) for
-every one of the 14 tools the server does *not* serve. The CPU command above
-serves only the 6 non-vision tools; `ImageDescription`, `CountGivenObject`,
-`RegionAttributeDescription`, `TextToBbox`, `DrawBox`, `AddText`, `TextToImage`
-and `ImageStylization` need a GPU (Qwen-VL-Chat / mmdet) — see
-[validate_on_gpu.sh](validate_on_gpu.sh) for the full-fidelity `--device cuda`
-command. **Vision-centric metrics from a CPU-only server are not comparable to
-published Agent-X numbers.** Setting `tool_server: ""` drops the server entirely
-and makes every tool a stub — plumbing check only.
-
-## Verified prediction format (was: "verify on first real run")
+## ⚠️ Verify on first real run
 
 `run_agentx.py::consolidate_predictions()` converts OpenCompass's on-disk
-predictions into the judge's `--pred_path` format. Confirmed against a real run:
-`predictions/<abbr>/Agent-X.json` is a dict keyed by task id (`"0"`, `"1"`, ...)
-with `{gold, prediction, origin_prompt, steps}`, and
+predictions into the judge's `--pred_path` format. The field layout is now
+verified against the vendored inferencer: with `infer_mode='every'`
+(`configs/datasets/gta_bench.py`), `AgentInferencer.save_multiround_results`
+writes each task as `{"gold", "prediction": [[step, …]], "origin_prompt",
+"steps": []}` — the reasoning trace is in `prediction` (a list of turns, each a
+list of `{role, content|tool_calls}` step dicts) and `steps` is always `[]`.
+Accordingly we take `reasoning_steps` from `prediction` and `final_answer` from
+the last assistant-content step.
 
-* `steps` is **always `[]`** — `AgentInferencerOutputHandler.
-  save_multiround_results()` seeds the key but never appends to it. The real
-  ReAct trace (thought + `tool_calls` + tool results) is in `prediction`, which
-  is a list of rounds of step dicts. `reasoning_steps` is taken from there.
-* only the **last** assistant `content` is the final answer; earlier `content`
-  fields are tool results (OCR dumps, boxes) and must not be folded into it.
+Still worth a spot-check on the first run: inspect a file under
+`opencompass/outputs/default/<ts>/predictions/<abbr>/Agent-X.json` and confirm the
+task keys match `data.json` (both keyed "0","1",…) and that a finish-action
+answer is present. The function raises loudly on an empty/unparseable result
+rather than emitting silently-wrong scores.

@@ -21,7 +21,6 @@ import json
 from pathlib import Path
 from datetime import datetime
 
-import boto3
 from dotenv import load_dotenv
 
 # raw judge key -> clean CSV/Athena column name (order defines CSV column order).
@@ -115,6 +114,8 @@ def average_scores(scores_path):
 
 def _upload_to_s3(local_path, s3_prefix):
     try:
+        import boto3  # lazy: report works locally without boto3/S3 (mirrors run_agentx.py)
+
         bucket = os.environ.get("AWS_S3_BUCKET_NAME", "")
         s3_key = f"{s3_prefix}/{local_path.name}"
         s3 = boto3.client(
