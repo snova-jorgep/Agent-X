@@ -7,7 +7,7 @@ __pycache__/
 # Local (uv) virtualenvs — see requirements-local/ + AGENTX_SETUP.md §1b
 .venv_agentlego/
 .venv_opencompass/
-venv_agentx_judge/
+.venv_agentx_judge/
 .venv/
 requirements_all.nomkl.txt
 
