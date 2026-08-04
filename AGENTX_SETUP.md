@@ -64,7 +64,7 @@ deactivate
 
 # --- Env 3: judge (openai 0.28, isolated) ---
 uv venv --python 3.10 .venv_agentx_judge
-source venv_agentx_judge/bin/activate
+source .venv_agentx_judge/bin/activate
 uv pip install -r requirements-local/judge.txt
 deactivate
 ```
