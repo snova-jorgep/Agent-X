@@ -147,6 +147,7 @@ def build_models(cfg):
                 f"            openai_api_base={base_url!r},\n"
                 f"            query_per_second={int(opts.get('query_per_second', 1))},\n"
                 f"            max_seq_len={int(opts.get('max_seq_len', 4096))},\n"
+                f"            timeout={int(opts.get('request_timeout', 300))},\n"
                 "            stop='<|im_end|>',\n"
                 "        ),\n"
                 f"        tool_server={opts['tool_server']!r},\n"
@@ -180,6 +181,12 @@ def render_eval_config(model_dicts):
         "    runner=dict(type=LocalRunner, task=dict(type=OpenICLInferTask)),\n"
         ")\n"
     )
+
+
+def mask_config_keys(text):
+    """Redact API keys (`key='...'`) for safe display. The real value is only
+    ever written to the on-disk config, never printed."""
+    return re.sub(r"key='[^']*'", "key='****'", text)
 
 
 def truncate_dataset(dataset_path, limit):
@@ -228,18 +235,27 @@ def latest_output_dir():
 def _extract_final_answer(prediction):
     """Pull the final assistant answer text out of an OpenCompass `prediction`.
 
-    `prediction` is typically nested like [[{"role": "assistant",
-    "content": "..."}]]. Fall back to the raw value if no content is found.
+    For GTA/AgentInferencer, `prediction` is a list of turns, each turn a list of
+    step dicts (see opencompass/models/lagent.py::chat). The agent's finish action
+    is emitted as the last ``{"role": "assistant", "content": ...}`` step — tool-call
+    steps carry no ``content`` and tool results use ``role="tool"``. We therefore
+    return the LAST assistant-content step (the finish answer), falling back to the
+    last content of any role, then to the raw value.
     """
     if isinstance(prediction, str):
         return prediction
-    texts = []
+
+    assistant_answer = None
+    last_any = None
 
     def _walk(node):
+        nonlocal assistant_answer, last_any
         if isinstance(node, dict):
             c = node.get("content")
-            if isinstance(c, str):
-                texts.append(c)
+            if isinstance(c, str) and c.strip():
+                last_any = c.strip()
+                if node.get("role") == "assistant":
+                    assistant_answer = c.strip()
             else:
                 for v in node.values():
                     _walk(v)
@@ -248,7 +264,7 @@ def _extract_final_answer(prediction):
                 _walk(item)
 
     _walk(prediction)
-    return " ".join(t.strip() for t in texts if t).strip() or prediction
+    return assistant_answer or last_any or (prediction if isinstance(prediction, str) else "")
 
 
 def consolidate_predictions(work_dir, abbr, dest):
@@ -260,8 +276,11 @@ def consolidate_predictions(work_dir, abbr, dest):
 
     OpenCompass writes predictions/<abbr>/Agent-X.json (final) or tmp_Agent-X.json
     (partial run) as a dict keyed by task id, each entry:
-        {"gold": ..., "prediction": [[...]], "origin_prompt": ..., "steps": ...}
-    We map steps -> reasoning_steps and the assistant content -> final_answer.
+        {"gold": ..., "prediction": [[...]], "origin_prompt": ..., "steps": []}
+    NOTE: with infer_mode='every' (gta_bench.py) the AgentInferencer only ever
+    populates "prediction" (a list of turns, each a list of step dicts); the
+    "steps" key is initialized to [] and never written to. So the reasoning trace
+    lives in "prediction", and the assistant finish step is the final answer.
     """
     pred_dir = work_dir / "predictions" / abbr
     if not pred_dir.exists():
@@ -281,9 +300,12 @@ def consolidate_predictions(work_dir, abbr, dest):
         for task_key, item in data.items():
             if not isinstance(item, dict):
                 continue
+            # Reasoning trace lives in "prediction" ("steps" is always []); `or`
+            # falls back to "steps" only if prediction is missing/empty.
+            prediction = item.get("prediction")
             merged[str(task_key)] = {
-                "reasoning_steps": item.get("steps", item.get("prediction")),
-                "final_answer": _extract_final_answer(item.get("prediction")),
+                "reasoning_steps": prediction or item.get("steps"),
+                "final_answer": _extract_final_answer(prediction),
             }
 
     if not merged:
@@ -336,8 +358,8 @@ def main():
         print(f"\n[DRY-RUN] Would back up {EVAL_CONFIG} -> {backup}")
         if limit and limit > 0:
             print(f"[DRY-RUN] Would truncate {dataset_path} to first {limit} task(s)")
-        print("[DRY-RUN] Would write generated config:\n")
-        print(render_eval_config(model_dicts))
+        print("[DRY-RUN] Would write generated config (API keys masked):\n")
+        print(mask_config_keys(render_eval_config(model_dicts)))
     else:
         shutil.copy2(EVAL_CONFIG, backup)
         EVAL_CONFIG.write_text(render_eval_config(model_dicts))
@@ -346,11 +368,17 @@ def main():
 
     try:
         # --- Inference (OpenCompass) --------------------------------------
+        # Without --debug, OpenCompass runs each model as an isolated task and
+        # continues past failures (one provider's error won't abort the batch).
+        # --debug runs sequentially in-process and raises on the first error —
+        # useful for diagnosing a single model, bad for multi-provider runs.
         infer_cmd = [
             "python", "run.py", "configs/eval_gta_bench.py",
             "--max-num-workers", str(opts.get("max_num_workers", 8)),
-            "--debug", "--mode", "infer",
+            "--mode", "infer",
         ]
+        if opts.get("debug", False):
+            infer_cmd.append("--debug")
         run_command(infer_cmd, output_base / "infer.log",
                     cwd=OPENCOMPASS_DIR, dry_run=dry_run)
 

@@ -1,0 +1,21 @@
+# Local (macOS / uv, no conda) pins for the Agent-X INFERENCE env (.venv_opencompass).
+# Install LAST, after `uv pip install ./agentlego ./opencompass` AND the dataset
+# download, so it corrects any transitive versions that break the import chain:
+#     uv pip install -r requirements-local/inference.txt
+#
+# Every pin here was needed to make lagent 0.2.2 + the OpenCompass import chain
+# work against current PyPI (newer releases dropped APIs these expect).
+
+# --- lagent 0.2.2 compatibility ---
+phx-class-registry==4.1.0      # 5.x moved AutoRegister out of the top-level namespace
+griffe<1.0                     # 1.x removed griffe.enumerations (lagent imports DocstringSectionKind from it)
+sentence-transformers>=2.7,<3  # 2.2.x imports cached_download, removed from huggingface-hub 0.26+
+
+# --- opencompass / transformers compatibility ---
+importlib_metadata             # opencompass.utils.dependency imports it directly
+huggingface-hub>=0.34,<1.0     # transformers requires <1.0 (the dataset download can bump it past this)
+
+# --- suite wrapper deps (run_agentx.py + agentx_report.py) ---
+boto3                          # S3 upload (lazy-imported; only needed when uploading)
+pyyaml
+python-dotenv

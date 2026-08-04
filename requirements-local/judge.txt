@@ -1,0 +1,7 @@
+# Local (macOS / uv) pins for the Agent-X JUDGE env (venv_agentx_judge).
+# The GPT judge (evaluation/run_eval_gpt_as_judge.py) uses the legacy openai 0.28
+# API, which is incompatible with the inference env's openai 1.x — hence a
+# separate venv, pointed at by config_agentx.yaml::judge_python.
+#     uv venv --python 3.10 venv_agentx_judge
+#     uv pip install -r requirements-local/judge.txt
+openai==0.28.0

@@ -444,6 +444,7 @@ class OpenAI(BaseAPIModel):
                  mode: str = 'none',
                  temperature: Optional[float] = None,
                  flush_every: int = 1,
+                 timeout: int = 300,
                  **gen_params):
 
         super().__init__(path=path,
@@ -455,6 +456,9 @@ class OpenAI(BaseAPIModel):
         import tiktoken
         self.tiktoken = tiktoken
         self.temperature = temperature
+        # Suite fork: per-request timeout so a stalled provider can't hang the
+        # whole run forever (requests.post default is no timeout = block forever).
+        self.timeout = timeout
         assert mode in ['none', 'front', 'mid', 'rear']
         self.mode = mode
         self.gen_params = gen_params
@@ -708,9 +712,15 @@ class OpenAI(BaseAPIModel):
 
                 raw_response = requests.post(self.url,
                                              headers=header,
-                                             data=json.dumps(data))
+                                             data=json.dumps(data),
+                                             timeout=self.timeout)
             except requests.ConnectionError:
                 self.logger.error('Got connection error, retrying...')
+                max_num_retries += 1
+                continue
+            except requests.Timeout:
+                self.logger.error('Request timed out after %ss, retrying...',
+                                  self.timeout)
                 max_num_retries += 1
                 continue
             try:
