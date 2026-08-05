@@ -117,6 +117,12 @@ def build_models(cfg):
     base_urls = cfg.get("base_urls", {})
     provider_api_keys = cfg.get("provider_api_keys", {})
     model_mappings = cfg.get("model_mappings", {})
+    # Per-provider request rate. Some endpoints are far stricter than the default
+    # (Cerebras allows 5 req/MINUTE = 0.083 qps); a ReAct run makes up to
+    # max_turn requests per task, so one global rate either dies on 429s or
+    # throttles every provider to the slowest one. Float: TokenBucket sleeps
+    # 1/rate seconds, so values below 1 are valid and necessary here.
+    provider_qps = cfg.get("provider_query_per_second", {})
 
     model_dicts, manifest = [], []
     # `stop` is model-family specific ('<|im_end|>' is ChatML/Qwen). Sending it to
@@ -139,6 +145,7 @@ def build_models(cfg):
         if not api_key:
             print(f"[WARN] Env var {key_env} empty for {provider}; skipping.")
             continue
+        qps = float(provider_qps.get(provider, opts.get("query_per_second", 1)))
         for alias, model_id in models.items():
             if model_id == "not_available":
                 print(f"[SKIP] {provider}/{alias}")
@@ -155,11 +162,16 @@ def build_models(cfg):
                 f"            path={model_id!r},\n"
                 f"            key={api_key!r},\n"
                 f"            openai_api_base={base_url!r},\n"
-                f"            query_per_second={int(opts.get('query_per_second', 1))},\n"
+                f"            query_per_second={qps},\n"
                 f"            max_seq_len={int(opts.get('max_seq_len', 4096))},\n"
                 f"            timeout={int(opts.get('request_timeout', 300))},\n"
-                "            stop='<|im_end|>',\n"
-                "        ),\n"
+                # Lands in OpenAI.gen_params -> merged over the request payload,
+                # overriding opencompass's 512 default. Reasoning-capable gemma-4
+                # endpoints (Together, Novita) spend the whole budget on
+                # `reasoning` and return content='' if this is left at 512.
+                f"            max_tokens={int(opts.get('max_out_len', 2048))},\n"
+                + (f"            stop={stop!r},\n" if stop else "")
+                + "        ),\n"
                 f"        tool_server={opts['tool_server']!r},\n"
                 f"        tool_meta={opts['tool_meta']!r},\n"
                 f"        batch_size={int(opts.get('batch_size', 8))},\n"
@@ -242,8 +254,13 @@ def latest_output_dir():
     return runs[-1] if runs else None
 
 
-def _flatten_steps(prediction):
-    """Flatten an OpenCompass `prediction` into its ordered list of ReAct steps.
+def _clean_answer(text):
+    """Strip stray markdown fences the ReAct protocol leaves on the answer."""
+    return re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", text.strip()).strip()
+
+
+def _extract_final_answer(prediction):
+    """Pull the final assistant answer text out of an OpenCompass `prediction`.
 
     For GTA/AgentInferencer, `prediction` is a list of turns, each turn a list of
     step dicts (see opencompass/models/lagent.py::chat). The agent's finish action
@@ -253,7 +270,7 @@ def _flatten_steps(prediction):
     last content of any role, then to the raw value.
     """
     if isinstance(prediction, str):
-        return prediction
+        return _clean_answer(prediction)
 
     assistant_answer = None
     last_any = None
@@ -274,7 +291,8 @@ def _flatten_steps(prediction):
                 _walk(item)
 
     _walk(prediction)
-    return assistant_answer or last_any or (prediction if isinstance(prediction, str) else "")
+    answer = assistant_answer or last_any or ""
+    return _clean_answer(answer) if answer else ""
 
 
 def consolidate_predictions(work_dir, abbr, dest):

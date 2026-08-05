@@ -15,6 +15,10 @@ agentx_options:
   batch_size: 8
   max_seq_len: 4096
   query_per_second: 1
+  # Per-request max_tokens. Overrides opencompass's 512 default: reasoning-capable
+  # gemma-4 endpoints (Together, Novita) emit a separate `reasoning` field and
+  # return content='' if the budget runs out before the answer starts.
+  max_out_len: 2048
   # Optional stop token, model-family specific. '<|im_end|>' is ChatML (Qwen /
   # InternVL). Leave empty for SambaNova-hosted gemma/llama — sending the wrong
   # stop leaves raw fence text ("```") glued onto the final answer.
@@ -39,6 +43,13 @@ base_urls:
   Cerebras:  "https://api.cerebras.ai/v1/chat/completions"
   Together:  "https://api.together.xyz/v1/chat/completions"
   Novita:    "https://api.novita.ai/openai/v1/chat/completions"
+
+# Per-provider request rate (req/sec), overriding agentx_options.query_per_second.
+# Cerebras enforces 5 requests per MINUTE (x-ratelimit-limit-requests-minute: 5),
+# and a ReAct task issues up to `max_turn` requests, so it needs 5/60 = 0.083 qps
+# with headroom. Omit a provider to use the global default.
+provider_query_per_second:
+  Cerebras: 0.07
 
 provider_api_keys:
   SambaNova: SAMBANOVA_API_KEY
