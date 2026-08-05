@@ -77,6 +77,67 @@ current PyPI. The file pins `phx-class-registry==4.1.0` (5.x moved `AutoRegister
 requires it; the dataset download bumps hub past it), plus `importlib_metadata`
 and the wrapper deps `boto3`/`pyyaml`/`python-dotenv`.
 
+## 1c. SambaNova cluster (`sc-vnc10`) — conda on shared NFS
+
+Verified on `sc-vnc10.sambanovasystems.com`. Same two conda envs as §1, but conda
+lives in the user's scratch space (no system conda on the VNC hosts) and the envs
+sit on the shared NFS mount so a GPU node can reuse them:
+
+```bash
+CONDA=/import/snvm-sc-scratch2/$USER/miniforge3        # miniforge, not system conda
+source "$CONDA/etc/profile.d/conda.sh"
+
+# Keep caches off $HOME — model/pip caches are large and $HOME is quota'd.
+export HF_HOME=/import/snvm-sc-scratch2/$USER/hf_cache
+export XDG_CACHE_HOME=/import/snvm-sc-scratch2/$USER/.cache
+export PIP_CACHE_DIR=/import/snvm-sc-scratch2/$USER/pip_cache
+```
+
+Envs, once built, are `agentlego` (py3.11: torch 2.1.2, mmcv 2.1.0, mmengine,
+mmpretrain, easyocr) and `opencompass` (py3.10, `opencompass` installed
+**editable** from this repo), plus the judge venv from §1b. Verify with:
+
+```bash
+conda activate opencompass
+python -c "from opencompass.models.openai_api import OpenAI; import inspect; \
+  print(inspect.getsourcefile(OpenAI))"     # MUST print this repo's path, not site-packages
+```
+
+If that prints a `site-packages` path the install is non-editable and the vendored
+fixes in `opencompass/opencompass/models/openai_api.py` (image handling, timeout,
+provider error handling) are silently inactive — reinstall with `pip install -e .`.
+
+**Three things differ from §1/§1b on this host:**
+
+1. **`conda activate` is mandatory — do not call the interpreter by absolute
+   path.** `run_agentx.py` spawns a bare `python run.py` subprocess, so `python`
+   must be on `PATH`. Running `.../envs/opencompass/bin/python run_agentx.py`
+   fails with `[Errno 2] No such file or directory: 'python'` and then, worse,
+   falls through to consolidate a *previous* run's output directory.
+
+2. **The judge venv name must match `judge_python` in the config.** §1b creates
+   `.venv_agentx_judge` (leading dot); an older layout used `venv_agentx_judge`.
+   Both are gitignored. If yours lacks the dot, symlink rather than edit config:
+   ```bash
+   ln -s venv_agentx_judge .venv_agentx_judge
+   ```
+   Otherwise inference runs fine and the judge dies on a missing interpreter.
+
+3. **No GPU on the VNC hosts.** Start the tool server with `--device cpu` (§4).
+   Only the OCR tool path is practical there, so `tool_accuracy` /
+   `toolset_accuracy` will be ~0. For the full tool stack, build the envs here and
+   run them on a GPU node — the envs are on shared NFS and were built on RHEL 8
+   (glibc 2.28) then executed on RHEL 10 (glibc 2.39), which is the compatible
+   direction:
+   ```bash
+   srun --reservation=vllm-stuff --partition=gpuonly --nodelist=sc3-c128 \
+        --gres=gpu:1 --pty bash
+   bash tests/agentx_snova/validate_on_gpu.sh
+   ```
+   See [validate_on_gpu.sh](validate_on_gpu.sh) — it checks CUDA visibility, the
+   `mmcv` CUDA ops, and the Qwen-VL-Chat load that backs `ImageDescription` /
+   `CountGivenObject` / `RegionAttributeDescription`.
+
 ## 2. Dataset
 
 Download from https://huggingface.co/datasets/Tajamul21/Agent-X into
@@ -100,6 +161,38 @@ uv pip install -U "huggingface-hub[cli]>=0.34,<1.0"   # constrained so it doesn'
 hf download Tajamul21/Agent-X --repo-type dataset --local-dir opencompass/data/agentx_dataset
 ln -s files opencompass/data/agentx_dataset/image     # so image/AgentX_*.jpg resolves
 ```
+
+### Subsets and `limit`
+
+`GTABenchDataset.load()` takes a **directory** and reads `<dir>/dataset.json`,
+resolving each task's file paths against that same directory. So a task set is a
+*directory*, and `agentx_options.dataset_dir` picks which one:
+
+```yaml
+dataset_dir: "data/agentx_dataset"   # the full 828
+dataset_dir: "data/cpu_runnable"     # a curated subset
+```
+
+To add a subset, make a directory with your filtered `dataset.json` and a symlink
+to the shared images — no copies of the ~2 GB image set:
+
+```bash
+cd opencompass/data
+mkdir -p cpu_runnable
+cp /path/to/your_filtered_tasks.json cpu_runnable/dataset.json
+ln -s ../agentx_dataset/image cpu_runnable/image
+```
+
+`agentx_options.limit` caps how many of those tasks run (`0` = all). It is applied
+through OpenCompass's native row slice — `run_agentx.py` injects
+`datasets[0]['reader_cfg']['test_range'] = '[:N]'` — so **no dataset file is ever
+copied or rewritten**, and an aborted run cannot corrupt your task set. `limit`
+takes the first N rows in file order, so it is a deterministic prefix, not a
+random sample.
+
+> Subset task keys must still match the judge ground truth (`data.json`, keyed
+> `"0"`, `"1"`, …) or the judge scores against the wrong tasks. Filtering the
+> original `dataset.json` preserves those keys; renumbering them breaks the judge.
 
 ## 3. API keys — `tests/agentx_snova/.env`
 
@@ -162,6 +255,32 @@ python agentx_report.py logs/agentx/<ts>          # aggregate scores.json -> res
 
 > Without AWS creds in `.env`, S3 uploads `[WARN]`-skip and the CSV stays local —
 > expected for a local run.
+
+## 5b. Provider caveats
+
+Hosted OpenAI-compatible endpoints are not interchangeable. Each item below was a
+real, silent failure — inference "succeeded" while producing empty or unusable
+traces.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Every task ends `"Please follow the format"` + `NoAction`, `final_answer` empty | Reasoning-capable models (gemma-4 on Together/Novita) emit a separate `reasoning` field and leave `content` empty until it finishes. OpenCompass defaults to `max_tokens=512`, entirely consumed by reasoning. | `agentx_options.max_out_len` (default 2048). Raise further if long tasks still come back empty. |
+| `400 invalid_image_data` / "Image data could not be decoded" | 110 of 758 dataset images are PNG/WebP named `.jpg`. MIME derived from the extension declares `image/jpeg` over PNG bytes. Lenient providers re-sniff; strict ones (Cerebras) reject. | Already fixed in `openai_api.py` (sniffs magic bytes). Don't revert to `mimetypes.guess_type`. |
+| `"extra_body: property 'extra_body' is unsupported"` | LMDeploy KV-session controls were injected into every non-`openai.com` request. Most providers ignore it; Cerebras rejects the request. | Now opt-in: pass `lmdeploy_session_controls=True` in the model dict only when targeting a real LMDeploy server. |
+| Task dies with a bare `RuntimeError: Calling OpenAI failed after retrying` and **no** error line | Rate limiting. Cerebras allows as few as **5 requests/minute**, and returns errors as `{"message","type","code"}` at the top level rather than nested under `error`, so the retry logic matched no branch and logged nothing. | `provider_query_per_second` (e.g. `Cerebras: 0.07`). Error handling now logs unrecognised shapes and backs off on `request_quota_exceeded`. |
+| `stop` token leaves `` ``` `` glued to the answer | `<|im_end|>` is ChatML (Qwen/InternVL), wrong for Gemma/Llama. | Leave `agentx_options.stop` empty unless the family needs it; `_clean_answer()` strips residual fences. |
+
+Provider rate limits are per-key and vary by tier — check
+`x-ratelimit-limit-requests-minute` on a response header before assuming the
+default 1 qps is safe.
+
+Before blaming the harness, probe the endpoint directly with the same payload
+shape it sends (base64 data URI in an `image_url` content part). Note that a
+provider's `/v1/models` listing is the authoritative check for whether a model
+exists: `POST /chat/completions` on Fireworks returns an identical `404
+NOT_FOUND` for an invalid key *and* an unavailable model, so it cannot
+distinguish the two. Models the provider doesn't serve belong in
+`model_mappings` as `"not_available"`.
 
 ## Output & metrics
 

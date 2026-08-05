@@ -2,9 +2,12 @@
 # See AGENTX_SETUP.md for setup and run flow.
 
 agentx_options:
-  # Dataset downloaded to opencompass/data/agentx_dataset/ (see AGENTX_SETUP.md).
+  # Task set to infer over: a directory holding dataset.json + the image/ it
+  # references. "data/agentx_dataset" = the full 828 (see AGENTX_SETUP.md §2);
+  # "data/cpu_runnable" = the 102-task CPU-runnable subset. Switching task sets
+  # is just this one line.
+  # "data/cpu_runnable" is another option
   dataset_dir: "data/agentx_dataset"
-  infer_dataset: "data/agentx_dataset/dataset.json"  # inference input; truncated by `limit`
   ground_truth: "data/agentx_dataset/data.json"      # judge --gt_data_path
   tool_meta: "data/agentx_dataset/toolmeta.json"
 
@@ -25,7 +28,7 @@ agentx_options:
   stop: ""
 
   max_num_workers: 8
-  limit: 5            # 0 = full 828 tasks; small N = smoke test
+  limit: 10            # 0 = full 828 tasks; small N = smoke test
   debug: false        # true = OpenCompass sequential in-process (aborts batch on 1st model error); false = isolated tasks, resilient
   request_timeout: 300  # per-request seconds; a stalled provider errors+retries instead of hanging the run forever
 
@@ -67,7 +70,8 @@ model_mappings:
     Gemma-4-31B:                         "gemma-4-31B-it"
   Fireworks:
   #   Llama-4-Maverick-17B-128E-Instruct: "accounts/fireworks/models/llama4-maverick-instruct-basic"
-    Gemma-4-31B:                         "accounts/fireworks/models/gemma-4-31b-it"
+  #  Gemma-4-31B:                         "accounts/fireworks/models/gemma-4-31b-it" # no serverless supported
+    Gemma-4-31B:                         "not_available"  
   Groq:
   #   Llama-4-Maverick-17B-128E-Instruct: "meta-llama/llama-4-maverick-17b-128e-instruct"
     Gemma-4-31B:                         "not_available"
