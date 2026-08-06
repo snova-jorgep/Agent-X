@@ -10,9 +10,11 @@ REGISTRY = Registry('helper')
 try:
     import lagent
     import agentlego
+    from lagent.agents.react import ReActProtocol
 except ImportError:
     lagent = None
     agentlego = None
+    ReActProtocol = object
 
 class DummyTool(agentlego.tools.BaseTool):
 
@@ -82,6 +84,81 @@ def react_style_history(history, files, protocol) -> List[dict]:
         elif step['role'] == 'assistant' and step.get('content'):
             inner_steps.append(dict(role='assistant', content=step['content']))
     return inner_steps
+
+
+class ReActProtocolFixed(ReActProtocol):
+    """ReActProtocol with two parsing bugs fixed.
+
+    Upstream ``ReActProtocol.parse`` (lagent/agents/react.py) mis-handles any
+    response that contains more than one ReAct step — which is what every model
+    produces when generation is not stopped at the turn boundary:
+
+    1. **Action/args mismatch.** The action name comes from
+       ``findall(r"Action:(.*?)\\n")[-1]`` (the LAST action) while the arguments
+       come from ``findall(r"Action Input:(.*)", re.DOTALL)[-1]``. Under DOTALL
+       the first match swallows the remainder of the string, so there is only
+       ever one match and ``[-1]`` is the FIRST args block. The result is the
+       last tool invoked with the first tool's arguments, plus all trailing
+       prose glued on — the source of the ``ARGS_ERROR: invalid json format``
+       entries in the prediction files.
+
+    2. **Final Answer short-circuits a real action.** ``Final Answer:`` is
+       tested before ``Action:``, so a response that calls a tool and then
+       hallucinates its way to an answer is recorded as a finish with zero tool
+       calls.
+
+    This subclass pairs each action with the args block that immediately
+    follows it, executes the FIRST action (ReAct is one step per turn; anything
+    after it is a fabricated future), and only treats the response as a finish
+    when no action precedes the ``Final Answer:``.
+
+    Setting ``agentx_options.stop`` to the ReAct turn boundary is still the
+    primary fix — it stops the model before it can fabricate at all. This is
+    the defensive layer for providers that ignore ``stop``.
+    """
+
+    def parse(self, message, action_executor):
+        import re
+
+        thought = message.split(self.action['begin'])[0]
+        thought = thought.split(self.thought['begin'])[-1]
+        thought = thought.split(self.finish['begin'])[0]
+
+        # Locate the first action and the first args block that FOLLOWS it, so
+        # the two always belong to the same ReAct step.
+        action_match = re.search(f"{re.escape(self.action['begin'])}(.*?)\n",
+                                 message)
+        finish_pos = message.find(self.finish['begin'])
+
+        # A Final Answer only wins if no action precedes it.
+        if finish_pos != -1 and (action_match is None
+                                 or action_match.start() > finish_pos):
+            final_answer = message[finish_pos + len(self.finish['begin']):]
+            return thought, action_executor.finish_action.name, final_answer
+
+        if action_match is None:
+            return thought, action_executor.no_action.name, ''
+
+        args_match = re.search(f"{re.escape(self.action_input['begin'])}(.*)",
+                               message[action_match.end():], re.DOTALL)
+        if args_match is None:
+            return thought, action_executor.no_action.name, ''
+
+        # Keep only this step's arguments: cut at the next Thought/Action/
+        # Response marker, which is where a fabricated continuation begins.
+        args = args_match.group(1)
+        cuts = [
+            args.find(marker) for marker in (
+                self.thought['begin'], self.action['begin'],
+                self.response['begin'], self.finish['begin'])
+            if args.find(marker) != -1
+        ]
+        if cuts:
+            args = args[:min(cuts)]
+        # Drop a trailing markdown fence left by models that wrap the step.
+        args = re.sub(r'\s*```\s*$', '', args.strip())
+
+        return thought, action_match.group(1).strip(), args.strip().strip('"')
 
 
 class LagentAgent:

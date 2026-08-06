@@ -169,9 +169,14 @@ resolving each task's file paths against that same directory. So a task set is a
 *directory*, and `agentx_options.dataset_dir` picks which one:
 
 ```yaml
-dataset_dir: "data/agentx_dataset"   # the full 828
-dataset_dir: "data/cpu_runnable"     # a curated subset
+dataset_dir: "data/agentx_dataset"   # the full 828, keyed "0".."827"
+dataset_dir: "data/gpu_runnable"     # 726 tasks needing the full tool stack
+dataset_dir: "data/cpu_runnable"     # 102 tasks runnable with the OCR-only CPU server
 ```
+
+`cpu_runnable` and `gpu_runnable` partition the full set. Both keep the original
+task keys, so `cpu_runnable` starts at 11, 20, 28, … — the keys are *not*
+renumbered, and must not be.
 
 To add a subset, make a directory with your filtered `dataset.json` and a symlink
 to the shared images — no copies of the ~2 GB image set:
@@ -193,6 +198,12 @@ random sample.
 > Subset task keys must still match the judge ground truth (`data.json`, keyed
 > `"0"`, `"1"`, …) or the judge scores against the wrong tasks. Filtering the
 > original `dataset.json` preserves those keys; renumbering them breaks the judge.
+>
+> How the key survives: `GTABenchDataset.load()` copies each task's key into a
+> `task_id` column, `AgentInferencer` records it on every prediction, and
+> `run_agentx.py::consolidate_predictions()` re-keys the judge input on it, then
+> checks every id against `ground_truth` before the judge starts. This is load-
+> bearing for subsets — see the note on prediction keys in §5c.
 
 ## 3. API keys — `tests/agentx_snova/.env`
 
@@ -246,7 +257,7 @@ this automatically in the normal flow):
 
 ```bash
 set -a; source .env; set +a
-venv_agentx_judge/bin/python evaluation/run_eval_gpt_as_judge.py \
+.venv_agentx_judge/bin/python evaluation/run_eval_gpt_as_judge.py \
   --save_path <model_dir>/scores.json \
   --gt_data_path opencompass/data/agentx_dataset/data.json \
   --pred_path <model_dir>/preds.json
@@ -264,11 +275,14 @@ traces.
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| **Almost no task calls a tool, on any provider, for the same model.** Traces are a single assistant step holding a fluent final answer | ReAct is a plain-text protocol with no tool-call API. With no stop sequence the model writes the WHOLE dialogue in one completion — inventing its own `Response:` lines — and `ReActProtocol.parse()` tests for `Final Answer:` before `Action:`, so every Action it emitted is discarded. Measured on SambaNova/gemma-4-31B tasks 0–7: **0/8 tasks called a tool**; with the stop boundary, **5/8 (10 calls)**. | `agentx_options.stop` must be the ReAct turn boundary (`["Response:", "\nResponse"]`), not a family EOS token. `ReActProtocolFixed` (injected automatically) is the second layer for providers that ignore `stop`. |
+| Turns after the first silently do nothing; `final_answer` empty and the trace stops early | `openai_api.py` capped the client-side budget at a hardcoded 4096 tokens, ignoring `max_seq_len`. Once the ReAct history crossed it, `_generate` returned `''` **without issuing a request** — indistinguishable from the model declining to act. | Fixed: `max_seq_len` is now the authority and the skip is logged as an ERROR. Keep `agentx_options.max_seq_len` above `prompt + max_turn * max_out_len` (32768 is ample; gemma-4-31B-it serves 131072). |
+| `ARGS_ERROR: invalid json format: {"image": …` with the JSON followed by pages of prose, or a tool invoked with another tool's arguments | Upstream `ReActProtocol.parse()` takes the **last** `Action:` but, because its args regex uses `re.DOTALL`, the **first** `Action Input:` block plus everything after it. | Fixed by `ReActProtocolFixed`, which pairs each action with its own args and cuts at the next `Thought:`/`Action:`/`Response:` marker. |
 | Every task ends `"Please follow the format"` + `NoAction`, `final_answer` empty | Reasoning-capable models (gemma-4 on Together/Novita) emit a separate `reasoning` field and leave `content` empty until it finishes. OpenCompass defaults to `max_tokens=512`, entirely consumed by reasoning. | `agentx_options.max_out_len` (default 2048). Raise further if long tasks still come back empty. |
 | `400 invalid_image_data` / "Image data could not be decoded" | 110 of 758 dataset images are PNG/WebP named `.jpg`. MIME derived from the extension declares `image/jpeg` over PNG bytes. Lenient providers re-sniff; strict ones (Cerebras) reject. | Already fixed in `openai_api.py` (sniffs magic bytes). Don't revert to `mimetypes.guess_type`. |
 | `"extra_body: property 'extra_body' is unsupported"` | LMDeploy KV-session controls were injected into every non-`openai.com` request. Most providers ignore it; Cerebras rejects the request. | Now opt-in: pass `lmdeploy_session_controls=True` in the model dict only when targeting a real LMDeploy server. |
 | Task dies with a bare `RuntimeError: Calling OpenAI failed after retrying` and **no** error line | Rate limiting. Cerebras allows as few as **5 requests/minute**, and returns errors as `{"message","type","code"}` at the top level rather than nested under `error`, so the retry logic matched no branch and logged nothing. | `provider_query_per_second` (e.g. `Cerebras: 0.07`). Error handling now logs unrecognised shapes and backs off on `request_quota_exceeded`. |
-| `stop` token leaves `` ``` `` glued to the answer | `<|im_end|>` is ChatML (Qwen/InternVL), wrong for Gemma/Llama. | Leave `agentx_options.stop` empty unless the family needs it; `_clean_answer()` strips residual fences. |
+| `stop` token leaves `` ``` `` glued to the answer | A tokenizer EOS token was put in `agentx_options.stop` — `<|im_end|>` is ChatML (Qwen/InternVL) and wrong for Gemma/Llama. | Keep `stop` to the ReAct turn boundary from the first row; never add a family EOS token to it. `_clean_answer()` strips residual fences. |
 
 Provider rate limits are per-key and vary by tier — check
 `x-ratelimit-limit-requests-minute` on a response header before assuming the
@@ -281,6 +295,38 @@ exists: `POST /chat/completions` on Fireworks returns an identical `404
 NOT_FOUND` for an invalid key *and* an unavailable model, so it cannot
 distinguish the two. Models the provider doesn't serve belong in
 `model_mappings` as `"not_available"`.
+
+## 5c. Reading a raw prediction file
+
+`run_agentx.py::consolidate_predictions()` converts OpenCompass's on-disk
+predictions into the judge's `--pred_path` format. With `infer_mode='every'`
+(`configs/datasets/gta_bench.py`), `AgentInferencer.save_multiround_results`
+writes each task as `{"gold", "prediction": [[step, …]], "origin_prompt",
+"steps": [], "task_id"}` — the reasoning trace is in `prediction` (a list of
+turns, each a list of `{role, content|tool_calls}` step dicts) and `steps` is
+always `[]`. Accordingly we take `reasoning_steps` from `prediction` and
+`final_answer` from the last assistant-content step.
+
+> **The top-level keys in `predictions/<abbr>/Agent-X.json` are row positions,
+> not task ids.** A `cpu_runnable` run shows `"0", "1", "2", …` even though the
+> task set starts at id 11 — key `"0"` *is* task 11. This looks like the wrong
+> dataset loaded; it is not. Read the `task_id` field to get the real id, or
+> check which image the trace references.
+>
+> The positional keys are deliberate: OpenCompass's own eval path does
+> `preds[str(i)] for i in range(len(preds))` (`tasks/openicl_eval.py`), so
+> re-keying the file would break `run.py --mode eval`. The translation to real
+> ids happens in `consolidate_predictions()`, at the judge boundary.
+
+Worth a spot-check on the first run of a new task set: confirm `task_id` is
+present, that it matches the ids in your `dataset.json`, and that a
+finish-action answer is there. `consolidate_predictions()` raises loudly on an
+empty/unparseable result, on duplicate ids (which is how a sharded run would
+otherwise silently drop tasks — `SizePartitioner` restarts row numbering in each
+`Agent-X_<n>.json`), and on any id missing from `ground_truth`. It warns and
+falls back to positional keys only for prediction files written before `task_id`
+existed — correct for `agentx_dataset`, wrong for any subset, so re-run
+inference rather than trusting that fallback.
 
 ## Output & metrics
 
@@ -308,21 +354,3 @@ in `agentx_results`).
 | clarity_penalty | Penalty for unclear/verbose reasoning (**higher = worse**, unlike the rest) |
 
 Metric definitions live in `evaluation/multiagent_evaluation.py` (`get_*` fns).
-
-## ⚠️ Verify on first real run
-
-`run_agentx.py::consolidate_predictions()` converts OpenCompass's on-disk
-predictions into the judge's `--pred_path` format. The field layout is now
-verified against the vendored inferencer: with `infer_mode='every'`
-(`configs/datasets/gta_bench.py`), `AgentInferencer.save_multiround_results`
-writes each task as `{"gold", "prediction": [[step, …]], "origin_prompt",
-"steps": []}` — the reasoning trace is in `prediction` (a list of turns, each a
-list of `{role, content|tool_calls}` step dicts) and `steps` is always `[]`.
-Accordingly we take `reasoning_steps` from `prediction` and `final_answer` from
-the last assistant-content step.
-
-Still worth a spot-check on the first run: inspect a file under
-`opencompass/outputs/default/<ts>/predictions/<abbr>/Agent-X.json` and confirm the
-task keys match `data.json` (both keyed "0","1",…) and that a finish-action
-answer is present. The function raises loudly on an empty/unparseable result
-rather than emitting silently-wrong scores.

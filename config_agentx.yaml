@@ -7,7 +7,7 @@ agentx_options:
   # "data/cpu_runnable" = the 102-task CPU-runnable subset. Switching task sets
   # is just this one line.
   # "data/cpu_runnable" is another option
-  dataset_dir: "data/agentx_dataset"
+  dataset_dir: "data/cpu_runnable"
   ground_truth: "data/agentx_dataset/data.json"      # judge --gt_data_path
   tool_meta: "data/agentx_dataset/toolmeta.json"
 
@@ -16,16 +16,31 @@ agentx_options:
   # ReAct agent settings.
   max_turn: 10
   batch_size: 8
-  max_seq_len: 4096
+  # Client-side prompt+generation budget (openai_api.py context_window). NOT the
+  # provider's context length — it only decides when the wrapper refuses to send
+  # a request. It must exceed prompt + max_turn * max_out_len or the later ReAct
+  # turns get dropped: at the old 4096 a single 2048-token turn pushed the
+  # history over budget and every subsequent turn returned '' WITHOUT an API
+  # call, silently burning the rest of the agent loop.
+  max_seq_len: 32768
   query_per_second: 1
   # Per-request max_tokens. Overrides opencompass's 512 default: reasoning-capable
   # gemma-4 endpoints (Together, Novita) emit a separate `reasoning` field and
   # return content='' if the budget runs out before the answer starts.
   max_out_len: 2048
-  # Optional stop token, model-family specific. '<|im_end|>' is ChatML (Qwen /
-  # InternVL). Leave empty for SambaNova-hosted gemma/llama — sending the wrong
-  # stop leaves raw fence text ("```") glued onto the final answer.
-  stop: ""
+  # ReAct turn boundary — REQUIRED, and not a model-family EOS token.
+  # ReAct is a plain-text protocol: the model is supposed to stop after
+  # `Action Input:` and let the harness run the tool and supply `Response:`.
+  # With no stop sequence it instead writes the WHOLE dialogue in one
+  # completion — inventing its own `Response:` lines and ending with
+  # `Final Answer:` — and ReActProtocol.parse() then returns the finish action,
+  # discarding every Action it emitted. Measured on SambaNova/gemma-4-31B over
+  # tasks 0-7: 0/8 tasks called a tool without this, 5/8 (10 calls) with it.
+  # Applies to every model family; unlike '<|im_end|>' it is protocol-level,
+  # not tokenizer-level. A bare string is accepted and wrapped in a list.
+  stop:
+    - "Response:"
+    - "\nResponse"
 
   max_num_workers: 8
   limit: 10            # 0 = full 828 tasks; small N = smoke test

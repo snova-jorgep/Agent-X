@@ -42,7 +42,8 @@ class AgentInferencerOutputHandler:
                                 origin_prompt: list,
                                 prediction: str,
                                 idx: int,
-                                gold: str = None):
+                                gold: str = None,
+                                task_id: str = None):
         result_dict = self.results_dict.get(str(idx), {
             'gold': [],
             'prediction': [],
@@ -52,6 +53,12 @@ class AgentInferencerOutputHandler:
         result_dict['gold'].append(gold)
         result_dict['prediction'].append(prediction)
         result_dict['origin_prompt'].append(origin_prompt)
+        # `idx` is the row position, which equals the dataset's own task id only
+        # when the source file is keyed 0..N-1. Datasets that expose a 'task_id'
+        # column get it recorded here so downstream consumers can recover the real
+        # id; the dict key stays positional for OpenCompass's own eval path.
+        if task_id is not None:
+            result_dict['task_id'] = str(task_id)
         self.results_dict[str(idx)] = result_dict
 
 
@@ -70,11 +77,17 @@ class AgentInferencer(ChatInferencer):
         input_columns = retriever.dataset_reader.input_columns
 
         for idx, ice_idx in enumerate(ice_idx_list):
+            row = retriever.test_ds[idx]
             entry = {
                 k: json.loads(item)
-                for k, item in retriever.test_ds[idx].items()
+                for k, item in row.items()
                 if k in input_columns
             }
+            # Passed through outside input_columns (so it never reaches prompt
+            # construction) and left as a plain string, unlike the json-encoded
+            # input columns above.
+            if 'task_id' in row:
+                entry['task_id'] = row['task_id']
             prompt_list.append(entry)
         return prompt_list
 
@@ -101,6 +114,7 @@ class AgentInferencer(ChatInferencer):
                 gold=list(
                     takewhile(lambda i: i['role'] != 'user', dialogs[i + 1:])),
                 idx=index,
+                task_id=chat.get('task_id'),
             )
 
         self.model.reset()
@@ -124,5 +138,6 @@ class AgentInferencer(ChatInferencer):
                 prediction=step,
                 gold=dialogs[i],
                 idx=index,
+                task_id=chat.get('task_id'),
             )
             self.model.reset()

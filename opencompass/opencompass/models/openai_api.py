@@ -642,14 +642,23 @@ class OpenAI(BaseAPIModel):
                 # images/other types are ignored for token estimation
             return ' '.join(buf)
 
-        # Heuristic model context windows
-        context_window = 4096
+        # Client-side prompt+generation budget. `max_seq_len` from the model
+        # config is the authority; the name heuristics below only RAISE it for
+        # well-known long-context names, they can no longer lower it.
+        #
+        # This used to default to a hardcoded 4096 for any path not matching
+        # '32k'/'16k'/'gpt-4', ignoring max_seq_len entirely on the PromptList
+        # path. A multi-turn ReAct history crossed that budget after one or two
+        # turns and `_generate` then returned '' WITHOUT issuing a request, so
+        # the remaining agent turns silently did nothing. Real windows are far
+        # larger (gemma-4-31B-it on SambaNova reports context_length=131072).
+        context_window = self.max_seq_len
         if '32k' in self.path:
-            context_window = 32768
+            context_window = max(context_window, 32768)
         elif '16k' in self.path:
-            context_window = 16384
+            context_window = max(context_window, 16384)
         elif 'gpt-4' in self.path:
-            context_window = 8192
+            context_window = max(context_window, 8192)
 
         # Optional trimming if input is a plain string and mode != 'none'
         if isinstance(input, str) and self.mode != 'none':
@@ -664,9 +673,17 @@ class OpenAI(BaseAPIModel):
 
         # Token budget guard (text parts only, images ignored for count)
         prompt_text = _text_for_token_count(messages)
-        max_out_len = min(
-            max_out_len, context_window - self.get_token_len(prompt_text) - 100)
+        prompt_tokens = self.get_token_len(prompt_text)
+        max_out_len = min(max_out_len, context_window - prompt_tokens - 100)
         if max_out_len <= 0:
+            # Returning '' here means no API call at all. In an agent loop that
+            # is indistinguishable from the model declining to act, so say so
+            # loudly instead of failing silently.
+            self.logger.error(
+                'Prompt is %s tokens but the client-side budget is only %s '
+                '(max_seq_len); returning empty WITHOUT calling the API. '
+                'Raise agentx_options.max_seq_len.', prompt_tokens,
+                context_window)
             return ''
 
         max_num_retries = 0

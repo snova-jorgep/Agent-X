@@ -2286,7 +2286,19 @@ class GTABenchDataset(BaseDataset):
             sample = {
                 'dialogs': json.dumps(dialogs),
                 'resources': json.dumps(tools + files),
-                'gt_answer': json.dumps(gt_answer)
+                'gt_answer': json.dumps(gt_answer),
+                # The task's own id from dataset.json. Dataset.from_list produces a
+                # positional dataset, so OpenCompass keys predictions by row number
+                # (0..N-1) — which only coincides with the id when dataset.json is
+                # the full set keyed "0".."827". Subsets like data/cpu_runnable are
+                # keyed 11, 20, 28, ..., so the row number is NOT the id, and the
+                # judge (which looks tasks up in data.json by key) would score every
+                # prediction against the wrong ground truth. Carrying the id as a
+                # column lets AgentInferencer record it alongside the prediction.
+                # NOT in reader_cfg['input_columns'] on purpose: prediction keys stay
+                # positional so OpenCompass's own --mode eval, which does
+                # `preds[str(i)] for i in range(len(preds))`, keeps working.
+                'task_id': str(idx),
             }
             data_list.append(sample)
 
