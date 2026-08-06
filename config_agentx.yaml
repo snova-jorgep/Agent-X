@@ -6,8 +6,8 @@ agentx_options:
   # references. "data/agentx_dataset" = the full 828 (see AGENTX_SETUP.md §2);
   # "data/cpu_runnable" = the 102-task CPU-runnable subset. Switching task sets
   # is just this one line.
-  # "data/cpu_runnable" is another option
-  dataset_dir: "data/cpu_runnable"
+  # "data/gpu_runnable" is another option
+  dataset_dir: "data/gpu_runnable"
   ground_truth: "data/agentx_dataset/data.json"      # judge --gt_data_path
   tool_meta: "data/agentx_dataset/toolmeta.json"
 
@@ -43,7 +43,7 @@ agentx_options:
     - "\nResponse"
 
   max_num_workers: 8
-  limit: 10            # 0 = full 828 tasks; small N = smoke test
+  limit: 102           # 0 = full 828 tasks; small N = smoke test
   debug: false        # true = OpenCompass sequential in-process (aborts batch on 1st model error); false = isolated tasks, resilient
   request_timeout: 300  # per-request seconds; a stalled provider errors+retries instead of hanging the run forever
 
