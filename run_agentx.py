@@ -25,6 +25,7 @@ import os
 import re
 import sys
 import json
+import time
 import shutil
 import subprocess
 from pathlib import Path
@@ -117,8 +118,28 @@ def build_models(cfg):
     base_urls = cfg.get("base_urls", {})
     provider_api_keys = cfg.get("provider_api_keys", {})
     model_mappings = cfg.get("model_mappings", {})
+    # Per-provider request rate. Some endpoints are far stricter than the default
+    # (Cerebras allows 5 req/MINUTE = 0.083 qps); a ReAct run makes up to
+    # max_turn requests per task, so one global rate either dies on 429s or
+    # throttles every provider to the slowest one. Float: TokenBucket sleeps
+    # 1/rate seconds, so values below 1 are valid and necessary here.
+    provider_qps = cfg.get("provider_query_per_second", {})
 
     model_dicts, manifest = [], []
+    # `stop` is the ReAct turn boundary (see config_agentx.yaml). Without it the
+    # model writes the whole dialogue in one completion and parse() discards
+    # every Action. Accept a bare string for backwards compatibility.
+    stop = opts.get("stop") or None
+    if isinstance(stop, str):
+        stop = [stop]
+    # tool_server is optional: when blank, LagentAgent registers only the
+    # DummyTool stubs from tool_meta (every call returns 'Dummy Result'). That
+    # validates plumbing without the AgentLego server but produces meaningless
+    # scores — never use it for a reportable run. Must be emitted as None (not
+    # ''), because LagentAgent gates on `is not None` and would call
+    # RemoteTool.from_server('') on an empty string.
+    tool_server = opts.get("tool_server") or None
+
     for provider, models in model_mappings.items():
         base_url = base_urls.get(provider)
         key_env = provider_api_keys.get(provider, "")
@@ -129,6 +150,7 @@ def build_models(cfg):
         if not api_key:
             print(f"[WARN] Env var {key_env} empty for {provider}; skipping.")
             continue
+        qps = float(provider_qps.get(provider, opts.get("query_per_second", 1)))
         for alias, model_id in models.items():
             if model_id == "not_available":
                 print(f"[SKIP] {provider}/{alias}")
@@ -145,12 +167,22 @@ def build_models(cfg):
                 f"            path={model_id!r},\n"
                 f"            key={api_key!r},\n"
                 f"            openai_api_base={base_url!r},\n"
-                f"            query_per_second={int(opts.get('query_per_second', 1))},\n"
+                f"            query_per_second={qps},\n"
                 f"            max_seq_len={int(opts.get('max_seq_len', 4096))},\n"
                 f"            timeout={int(opts.get('request_timeout', 300))},\n"
-                "            stop='<|im_end|>',\n"
-                "        ),\n"
-                f"        tool_server={opts['tool_server']!r},\n"
+                # Lands in OpenAI.gen_params -> merged over the request payload,
+                # overriding opencompass's 512 default. Reasoning-capable gemma-4
+                # endpoints (Together, Novita) spend the whole budget on
+                # `reasoning` and return content='' if this is left at 512.
+                f"            max_tokens={int(opts.get('max_out_len', 2048))},\n"
+                + (f"            stop={stop!r},\n" if stop else "")
+                + "        ),\n"
+                # ReActProtocolFixed pairs each Action with its OWN Action Input
+                # and prefers an Action that precedes a Final Answer; upstream
+                # ReActProtocol takes the LAST action with the FIRST args block
+                # and short-circuits on Final Answer. See opencompass/models/lagent.py.
+                "        protocol=dict(type=ReActProtocolFixed),\n"
+                f"        tool_server={tool_server!r},\n"
                 f"        tool_meta={opts['tool_meta']!r},\n"
                 f"        batch_size={int(opts.get('batch_size', 8))},\n"
                 "    ),"
@@ -160,21 +192,35 @@ def build_models(cfg):
     return model_dicts, manifest
 
 
-def render_eval_config(model_dicts):
-    """Full source of a generated eval_gta_bench.py with our models injected."""
+def render_eval_config(model_dicts, dataset_dir, limit=0):
+    """Full source of a generated eval_gta_bench.py with our models + dataset injected.
+
+    Two overrides are applied to the imported gta_bench dataset dict:
+
+    * ``path`` — gta_bench.py hardcodes 'data/agentx_dataset'. GTABenchDataset.load()
+      takes a DIRECTORY and reads ``<dir>/dataset.json``, resolving each task's file
+      paths against it, so switching task sets means pointing at another such
+      directory (see agentx_options.dataset_dir).
+    * ``reader_cfg['test_range']`` — OpenCompass's native row slice ('[:5]' keeps the
+      first 5). This is how `limit` is applied: no file is copied or rewritten.
+    """
     body = "\n".join(model_dicts)
+    limit_line = (f"datasets[0]['reader_cfg']['test_range'] = '[:{int(limit)}]'\n"
+                  if limit and int(limit) > 0 else "")
     return (
         "# AUTO-GENERATED by run_agentx.py — do not edit. Original backed up as\n"
         "# eval_gta_bench.py.suite-bak and restored after the run.\n"
         "from lagent.agents import ReAct\n"
         "from mmengine.config import read_base\n"
         "from opencompass.models import OpenAI, Qwen, Gemini\n"
-        "from opencompass.models.lagent import LagentAgent\n"
+        "from opencompass.models.lagent import LagentAgent, ReActProtocolFixed\n"
         "from opencompass.partitioners import SizePartitioner\n"
         "from opencompass.runners import LocalRunner\n"
         "from opencompass.tasks import OpenICLInferTask\n\n"
         "with read_base():\n"
         "    from .datasets.gta_bench import gta_bench_datasets as datasets\n\n"
+        f"datasets[0]['path'] = {dataset_dir!r}\n"
+        f"{limit_line}\n"
         f"models = [\n{body}\n]\n\n"
         "infer = dict(\n"
         "    partitioner=dict(type=SizePartitioner, max_task_size=50, gen_task_coef=1),\n"
@@ -189,47 +235,51 @@ def mask_config_keys(text):
     return re.sub(r"key='[^']*'", "key='****'", text)
 
 
-def truncate_dataset(dataset_path, limit):
-    """Back up dataset.json and rewrite it with only the first `limit` tasks, so a
-    smoke test runs a handful of tasks instead of all 828. Returns the backup path
-    (to restore later), or None if no truncation happened.
+def describe_dataset(dataset_dir, limit):
+    """Report which task set will run. Read-only — nothing is copied or rewritten.
 
-    dataset.json is a dict keyed by task id (per the judge: gt_data[key][0][...]).
-    Falls back to list slicing if the top level is a list.
+    GTABenchDataset.load() reads `<dataset_dir>/dataset.json` and resolves each
+    task's file paths against that same directory, so a task set is selected by
+    pointing `dataset_dir` at a directory laid out that way (see AGENTX_SETUP.md).
     """
-    if not limit or limit <= 0:
-        return None
-    if not dataset_path.exists():
-        print(f"[WARN] dataset not found at {dataset_path}; cannot apply limit.")
-        return None
-
-    with open(dataset_path) as f:
-        data = json.load(f)
-
-    if isinstance(data, dict):
-        subset = dict(list(data.items())[:limit])
-    elif isinstance(data, list):
-        subset = data[:limit]
-    else:
-        print(f"[WARN] Unexpected dataset.json type {type(data)}; skipping limit.")
-        return None
-
-    backup = dataset_path.with_suffix(".json.suite-bak")
-    shutil.copy2(dataset_path, backup)
-    with open(dataset_path, "w") as f:
-        json.dump(subset, f, indent=2)
-    print(f"[LIMIT] Truncated dataset to {len(subset)} task(s); "
-          f"original backed up as {backup.name}")
-    return backup
+    data_file = dataset_dir / "dataset.json"
+    if not data_file.exists():
+        raise FileNotFoundError(
+            f"No dataset.json in {dataset_dir}. agentx_options.dataset_dir must "
+            "name a directory containing dataset.json plus the image/ it references.")
+    with open(data_file) as f:
+        total = len(json.load(f))
+    n = min(total, int(limit)) if limit and int(limit) > 0 else total
+    print(f"[DATASET] {dataset_dir.name}: {n} of {total} task(s)"
+          f"{'' if n == total else f' (limit={limit})'}")
 
 
-def latest_output_dir():
-    """Newest OpenCompass run dir under opencompass/outputs/default/."""
+def latest_output_dir(newer_than=None):
+    """Newest OpenCompass run dir under opencompass/outputs/default/.
+
+    `newer_than` (a time.time() stamp taken before inference started) rejects
+    directories left over from earlier runs. Without it, an inference that dies
+    before creating its own output dir — a bad interpreter, an import error, a
+    missing dataset — silently falls through to a PREVIOUS run's predictions,
+    which are then consolidated, summarised and UPLOADED under today's run id.
+    That has happened (see AGENTX_SETUP.md §1c) and is indistinguishable from a
+    real result: the task count is simply wrong.
+    """
     outputs = OPENCOMPASS_DIR / "outputs" / "default"
     if not outputs.exists():
         return None
+    if newer_than is not None:
+        runs = sorted((p for p in outputs.iterdir()
+                       if p.is_dir() and p.stat().st_mtime >= newer_than),
+                      key=lambda p: p.name)
+        return runs[-1] if runs else None
     runs = sorted((p for p in outputs.iterdir() if p.is_dir()), key=lambda p: p.name)
     return runs[-1] if runs else None
+
+
+def _clean_answer(text):
+    """Strip stray markdown fences the ReAct protocol leaves on the answer."""
+    return re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", text.strip()).strip()
 
 
 def _extract_final_answer(prediction):
@@ -243,7 +293,7 @@ def _extract_final_answer(prediction):
     last content of any role, then to the raw value.
     """
     if isinstance(prediction, str):
-        return prediction
+        return _clean_answer(prediction)
 
     assistant_answer = None
     last_any = None
@@ -264,19 +314,30 @@ def _extract_final_answer(prediction):
                 _walk(item)
 
     _walk(prediction)
-    return assistant_answer or last_any or (prediction if isinstance(prediction, str) else "")
+    answer = assistant_answer or last_any or ""
+    return _clean_answer(answer) if answer else ""
 
 
-def consolidate_predictions(work_dir, abbr, dest):
+def consolidate_predictions(work_dir, abbr, dest, gt_path=None):
     """Convert OpenCompass predictions for one model into the judge's format.
 
     The judge (evaluation/run_eval_gpt_as_judge.py) expects `--pred_path` to be a
-    JSON list where each element is {task_key: {"reasoning_steps": ...,
-    "final_answer": ...}}, keyed by the same task id as data.json ("0", "1", ...).
+    JSON list where each element is {task_id: {"reasoning_steps": ...,
+    "final_answer": ...}}, keyed by the same task id as data.json, because it
+    looks the ground truth up as `gt_data[key]`.
 
     OpenCompass writes predictions/<abbr>/Agent-X.json (final) or tmp_Agent-X.json
-    (partial run) as a dict keyed by task id, each entry:
-        {"gold": ..., "prediction": [[...]], "origin_prompt": ..., "steps": []}
+    (partial run) as a dict keyed by ROW POSITION (0..N-1), each entry:
+        {"gold": ..., "prediction": [[...]], "origin_prompt": ..., "steps": [],
+         "task_id": "11"}
+    The row position is NOT the task id unless dataset.json happens to be keyed
+    0..N-1 — true for data/agentx_dataset (828 tasks) but false for the subsets:
+    cpu_runnable starts 11, 20, 28, ... So we re-key on the "task_id" field that
+    GTABenchDataset.load() attaches and AgentInferencer records. Without it the
+    judge silently scores task 11's prediction against task 0's ground truth —
+    no KeyError, just wrong numbers. Positional keys are used only as a fallback
+    for prediction files produced before task_id existed.
+
     NOTE: with infer_mode='every' (gta_bench.py) the AgentInferencer only ever
     populates "prediction" (a list of turns, each a list of step dicts); the
     "steps" key is initialized to [] and never written to. So the reasoning trace
@@ -294,16 +355,34 @@ def consolidate_predictions(work_dir, abbr, dest):
     use_files = final_files or files
 
     merged = {}
+    legacy_keyed = 0
     for pf in use_files:
         with open(pf) as f:
             data = json.load(f)
-        for task_key, item in data.items():
+        for row_key, item in data.items():
             if not isinstance(item, dict):
                 continue
+            task_id = item.get("task_id")
+            if task_id is None:
+                # Pre-task_id prediction file: fall back to the row position and
+                # warn, since it is only correct for the full 828-task set.
+                task_id = str(row_key)
+                legacy_keyed += 1
+            task_id = str(task_id)
+            if task_id in merged:
+                # SizePartitioner splits large datasets into Agent-X_0.json,
+                # Agent-X_1.json, ... each keyed from 0 — so positional keys
+                # collide across shards and silently drop tasks.
+                raise ValueError(
+                    f"Duplicate task id {task_id!r} while consolidating {abbr} "
+                    f"from {[p.name for p in use_files]}. Predictions cannot be "
+                    "merged unambiguously; re-run inference so every record "
+                    "carries a task_id."
+                )
             # Reasoning trace lives in "prediction" ("steps" is always []); `or`
             # falls back to "steps" only if prediction is missing/empty.
             prediction = item.get("prediction")
-            merged[str(task_key)] = {
+            merged[task_id] = {
                 "reasoning_steps": prediction or item.get("steps"),
                 "final_answer": _extract_final_answer(prediction),
             }
@@ -311,11 +390,76 @@ def consolidate_predictions(work_dir, abbr, dest):
     if not merged:
         raise ValueError(f"No predictions parsed for {abbr} in {pred_dir}.")
 
+    if legacy_keyed:
+        print(f"[WARN] {abbr}: {legacy_keyed} prediction(s) had no task_id and were "
+              "keyed by row position. That is only correct if inference ran over "
+              "data/agentx_dataset — for a subset the judge will score against the "
+              "wrong ground truth. Re-run inference to fix.")
+
+    # The judge does gt_data[key] with no guard, so a key missing from data.json
+    # is a KeyError mid-run. Catch it here, where the message is actionable.
+    if gt_path is not None:
+        with open(gt_path) as f:
+            gt_keys = set(json.load(f))
+        missing = sorted(set(merged) - gt_keys, key=lambda k: (len(k), k))
+        if missing:
+            raise ValueError(
+                f"{abbr}: {len(missing)} task id(s) absent from ground truth "
+                f"{gt_path}: {missing[:10]}{' ...' if len(missing) > 10 else ''}. "
+                "dataset_dir and ground_truth are out of sync."
+            )
+
     pred_list = [{k: v} for k, v in merged.items()]
     with open(dest, "w") as f:
         json.dump(pred_list, f, indent=2)
     print(f"[PRED] {abbr}: {len(pred_list)} tasks -> {dest}")
     return dest
+
+
+def summarize_predictions(preds_path):
+    """Print trace stats for an infer-only run (run_eval: false).
+
+    Without a judge there is no score, so this is the only signal that inference
+    actually exercised the agent loop: a run where every task has 0 tool calls
+    means the tool server or the ReAct protocol is not being used, no matter how
+    cleanly OpenCompass exited.
+    """
+    with open(preds_path) as f:
+        pred_list = json.load(f)
+
+    def _walk_steps(node):
+        """Yield every step dict in a `reasoning_steps` value.
+
+        `reasoning_steps` is the OpenCompass `prediction` field: a list of TURNS,
+        each turn a list of step dicts — NOT a flat list of steps. Iterating it
+        directly yields lists, so an `isinstance(s, dict)` filter matched nothing
+        and this summary reported 0 tool calls for every run regardless of the
+        traces. Recurse instead of assuming a fixed nesting depth.
+        """
+        if isinstance(node, dict):
+            yield node
+        elif isinstance(node, list):
+            for item in node:
+                yield from _walk_steps(item)
+
+    n = len(pred_list)
+    with_answer = with_tools = with_error = 0
+    total_calls = 0
+    for entry in pred_list:
+        value = next(iter(entry.values()))
+        steps = list(_walk_steps(value.get("reasoning_steps") or []))
+        calls = sum(len(s.get("tool_calls") or []) for s in steps)
+        total_calls += calls
+        with_tools += calls > 0
+        with_error += any(s.get("error") for s in steps)
+        with_answer += bool(value.get("final_answer"))
+
+    print(f"[SUMMARY] {n} task(s) | final_answer: {with_answer}/{n} | "
+          f"used tools: {with_tools}/{n} ({total_calls} calls) | "
+          f"step errors: {with_error}/{n}")
+    if n and not with_tools:
+        print("[WARN] No tool calls in any trace — check that the AgentLego tool "
+              "server is reachable and that agentx_options.tool_server is set.")
 
 
 def main():
@@ -348,23 +492,20 @@ def main():
         print(f"   - {m['provider']}/{m['alias']} (abbr={m['abbr']})")
 
     limit = opts.get("limit", 0)
-    # Truncate the INFERENCE dataset (dataset.json) to limit how many tasks run,
-    # NOT the judge ground_truth (data.json) — different files, different schemas.
-    dataset_path = OPENCOMPASS_DIR / opts.get("infer_dataset", opts["ground_truth"])
+    # Which task set to infer over: a directory holding dataset.json + the image/
+    # it references. NOT the judge ground_truth (data.json) — different schema.
+    dataset_dir = opts.get("dataset_dir", "data/agentx_dataset")
+    describe_dataset(OPENCOMPASS_DIR / dataset_dir, limit)
 
     backup = EVAL_CONFIG.with_suffix(".py.suite-bak")
-    dataset_backup = None
     if dry_run:
         print(f"\n[DRY-RUN] Would back up {EVAL_CONFIG} -> {backup}")
-        if limit and limit > 0:
-            print(f"[DRY-RUN] Would truncate {dataset_path} to first {limit} task(s)")
         print("[DRY-RUN] Would write generated config (API keys masked):\n")
-        print(mask_config_keys(render_eval_config(model_dicts)))
+        print(mask_config_keys(render_eval_config(model_dicts, dataset_dir, limit)))
     else:
         shutil.copy2(EVAL_CONFIG, backup)
-        EVAL_CONFIG.write_text(render_eval_config(model_dicts))
+        EVAL_CONFIG.write_text(render_eval_config(model_dicts, dataset_dir, limit))
         print(f"[OK] Injected {len(manifest)} model(s) into {EVAL_CONFIG}")
-        dataset_backup = truncate_dataset(dataset_path, limit)
 
     try:
         # --- Inference (OpenCompass) --------------------------------------
@@ -379,13 +520,18 @@ def main():
         ]
         if opts.get("debug", False):
             infer_cmd.append("--debug")
+        # Taken BEFORE inference so latest_output_dir() can reject stale dirs.
+        infer_started = time.time()
         run_command(infer_cmd, output_base / "infer.log",
                     cwd=OPENCOMPASS_DIR, dry_run=dry_run)
 
-        work_dir = latest_output_dir() if not dry_run else None
+        work_dir = latest_output_dir(infer_started) if not dry_run else None
         if not dry_run:
             if work_dir is None:
                 print("[ERROR] No OpenCompass output dir found after inference.")
+                print("        Inference produced no output of its own — see "
+                      f"{output_base / 'infer.log'}. Refusing to fall back to a "
+                      "previous run's predictions.")
                 sys.exit(1)
             print(f"[INFO] OpenCompass work dir: {work_dir}")
 
@@ -402,7 +548,9 @@ def main():
                 continue
 
             try:
-                consolidate_predictions(work_dir, m["abbr"], preds_path)
+                consolidate_predictions(
+                    work_dir, m["abbr"], preds_path,
+                    gt_path=OPENCOMPASS_DIR / opts["ground_truth"])
             except Exception as e:
                 print(f"[WARN] {m['provider']}/{m['alias']} prediction consolidation "
                       f"failed: {e}")
@@ -427,6 +575,7 @@ def main():
                 run_command(judge_cmd, model_dir / "judge.log", dry_run=False)
             else:
                 print(f"[SKIP-EVAL] {m['provider']}/{m['alias']} (run_eval=false)")
+                summarize_predictions(preds_path)
 
             # Upload raw artifacts.
             model_s3 = f"{s3_prefix}/{m['provider']}/{m['alias']}"
@@ -434,13 +583,11 @@ def main():
                 if artifact.exists():
                     upload_file(artifact, model_s3)
     finally:
-        # Always restore the original config + dataset.
+        # Always restore the original config. The dataset needs no restore: it is
+        # only ever read — `limit` is applied by reader_cfg['test_range'].
         if not dry_run and backup.exists():
             shutil.move(str(backup), str(EVAL_CONFIG))
             print(f"[OK] Restored original {EVAL_CONFIG}")
-        if dataset_backup and dataset_backup.exists():
-            shutil.move(str(dataset_backup), str(dataset_path))
-            print(f"[OK] Restored original {dataset_path}")
 
     if not dry_run and run_eval:
         generate_report(str(output_base), s3_prefix)

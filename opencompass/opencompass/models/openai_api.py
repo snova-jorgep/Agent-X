@@ -461,6 +461,15 @@ class OpenAI(BaseAPIModel):
         self.timeout = timeout
         assert mode in ['none', 'front', 'mid', 'rear']
         self.mode = mode
+        # LMDeploy KV-session controls are injected as a literal `extra_body`
+        # property. That is only meaningful for a self-hosted LMDeploy server;
+        # hosted OpenAI-compatible providers either ignore it (SambaNova,
+        # Together, Novita) or reject the whole request (Cerebras:
+        # "extra_body: property 'extra_body' is unsupported"). Opt in explicitly
+        # instead of applying it to every non-openai.com URL. Popped so the flag
+        # itself never reaches the request payload.
+        self.lmdeploy_session_controls = bool(
+            gen_params.pop('lmdeploy_session_controls', False))
         self.gen_params = gen_params
 
         if isinstance(key, str):
@@ -539,10 +548,28 @@ class OpenAI(BaseAPIModel):
                 import mimetypes
                 import os
                 path = url[7:] if url.startswith('file://') else url
-                mime = mimetypes.guess_type(path)[0] or ''
-                if os.path.isfile(path) and mime.startswith('image/'):
+                if os.path.isfile(path):
                     with open(path, 'rb') as _imgf:
-                        b64 = base64.b64encode(_imgf.read()).decode('utf-8')
+                        _raw = _imgf.read()
+                    # Sniff the REAL format from the magic bytes; the Agent-X
+                    # dataset names PNGs and WebPs ".jpg" (110 of 758 files), so
+                    # trusting the extension declares image/jpeg over PNG bytes.
+                    # Lenient providers re-sniff and cope; strict ones (Cerebras)
+                    # reject it with "Image data could not be decoded".
+                    if _raw.startswith(b'\x89PNG\r\n\x1a\n'):
+                        mime = 'image/png'
+                    elif _raw.startswith(b'\xff\xd8\xff'):
+                        mime = 'image/jpeg'
+                    elif _raw[:4] == b'RIFF' and _raw[8:12] == b'WEBP':
+                        mime = 'image/webp'
+                    elif _raw.startswith((b'GIF87a', b'GIF89a')):
+                        mime = 'image/gif'
+                    else:  # not a recognised image: fall back to the extension
+                        mime = mimetypes.guess_type(path)[0] or ''
+                else:
+                    _raw, mime = None, ''
+                if _raw is not None and mime.startswith('image/'):
+                    b64 = base64.b64encode(_raw).decode('utf-8')
                     url = f'data:{mime};base64,{b64}'
                 else:
                     # Missing file or non-image (e.g. a video that was not
@@ -615,14 +642,23 @@ class OpenAI(BaseAPIModel):
                 # images/other types are ignored for token estimation
             return ' '.join(buf)
 
-        # Heuristic model context windows
-        context_window = 4096
+        # Client-side prompt+generation budget. `max_seq_len` from the model
+        # config is the authority; the name heuristics below only RAISE it for
+        # well-known long-context names, they can no longer lower it.
+        #
+        # This used to default to a hardcoded 4096 for any path not matching
+        # '32k'/'16k'/'gpt-4', ignoring max_seq_len entirely on the PromptList
+        # path. A multi-turn ReAct history crossed that budget after one or two
+        # turns and `_generate` then returned '' WITHOUT issuing a request, so
+        # the remaining agent turns silently did nothing. Real windows are far
+        # larger (gemma-4-31B-it on SambaNova reports context_length=131072).
+        context_window = self.max_seq_len
         if '32k' in self.path:
-            context_window = 32768
+            context_window = max(context_window, 32768)
         elif '16k' in self.path:
-            context_window = 16384
+            context_window = max(context_window, 16384)
         elif 'gpt-4' in self.path:
-            context_window = 8192
+            context_window = max(context_window, 8192)
 
         # Optional trimming if input is a plain string and mode != 'none'
         if isinstance(input, str) and self.mode != 'none':
@@ -637,9 +673,17 @@ class OpenAI(BaseAPIModel):
 
         # Token budget guard (text parts only, images ignored for count)
         prompt_text = _text_for_token_count(messages)
-        max_out_len = min(
-            max_out_len, context_window - self.get_token_len(prompt_text) - 100)
+        prompt_tokens = self.get_token_len(prompt_text)
+        max_out_len = min(max_out_len, context_window - prompt_tokens - 100)
         if max_out_len <= 0:
+            # Returning '' here means no API call at all. In an agent loop that
+            # is indistinguishable from the model declining to act, so say so
+            # loudly instead of failing silently.
+            self.logger.error(
+                'Prompt is %s tokens but the client-side budget is only %s '
+                '(max_seq_len); returning empty WITHOUT calling the API. '
+                'Raise agentx_options.max_seq_len.', prompt_tokens,
+                context_window)
             return ''
 
         max_num_retries = 0
@@ -684,10 +728,11 @@ class OpenAI(BaseAPIModel):
                 )
                 data = {**data, **self.gen_params}
 
-                # --- LMDeploy session controls (only when not using OpenAI) ---
+                # --- LMDeploy session controls (opt-in) ---
                 # If you're pointing at LMDeploy (e.g., http://host:12580/v1/chat/completions),
-                # add session cleanup flags so KV does not accumulate.
-                if "openai.com" not in self.url:
+                # add session cleanup flags so KV does not accumulate. Enable with
+                # lmdeploy_session_controls=True in the model dict.
+                if self.lmdeploy_session_controls:
                     with self._ctr_lock:
                         self._req_ctr += 1
                         req_id = self._req_ctr
@@ -734,13 +779,21 @@ class OpenAI(BaseAPIModel):
                 response = response.get('data', response)
                 return response['choices'][0]['message']['content'].strip()
             except KeyError:
-                if 'error' in response:
-                    code = None
-                    if isinstance(response['error'], dict):
-                        code = response['error'].get('code')
-                    if code == 'rate_limit_exceeded':
-                        time.sleep(1)
-                        self.logger.warn('Rate limit exceeded, retrying...')
+                # Providers disagree on the error envelope: OpenAI/Fireworks nest
+                # it under 'error', Cerebras returns {'message', 'type', 'code'}
+                # at the top level. Without the second case a Cerebras 429 fell
+                # through both branches and was retried with NOTHING logged.
+                err = response.get('error') if 'error' in response else (
+                    response if 'message' in response else None)
+                if err is not None:
+                    code = err.get('code') if isinstance(err, dict) else None
+                    if code in ('rate_limit_exceeded', 'request_quota_exceeded'):
+                        # Cerebras allows as few as 5 req/min; 1s is not enough
+                        # to clear a per-minute window, so back off properly.
+                        backoff = 5 * (max_num_retries + 1)
+                        self.logger.warn('Rate limit exceeded, retrying in %ss...',
+                                         backoff)
+                        time.sleep(backoff)
                         max_num_retries += 1
                         continue
                     elif code == 'insufficient_quota':
@@ -750,7 +803,10 @@ class OpenAI(BaseAPIModel):
                         continue
 
                     self.logger.error('Find error message in response: %s',
-                                      str(response['error']))
+                                      str(err))
+                else:
+                    self.logger.error('Unrecognised response shape: %s',
+                                      str(response)[:500])
             except TypeError:
                 self.logger.error('Error response: %s', str(response))
             max_num_retries += 1
