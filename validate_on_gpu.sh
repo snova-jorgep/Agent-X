@@ -9,10 +9,14 @@
 # RHEL 10 (glibc 2.39) - old-glibc-on-new-glibc is the compatible direction.
 
 set -uo pipefail
-CONDA=/import/snvm-sc-scratch2/rodrigom/miniforge3
-export HF_HOME=/import/snvm-sc-scratch2/rodrigom/hf_cache
-export XDG_CACHE_HOME=/import/snvm-sc-scratch2/rodrigom/.cache
-export PIP_CACHE_DIR=/import/snvm-sc-scratch2/rodrigom/pip_cache
+CONDA=/import/snvm-sc-scratch2/$USER/miniforge3
+# Keep caches off $HOME (quota'd) but DEFER to anything already exported: a shell rc
+# that already points these at scratch would otherwise be overridden here, and the
+# ~20GB Qwen-VL-Chat download would land in a second, redundant tree. `:-` is safe
+# under `set -u` because it always supplies a value.
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/import/snvm-sc-scratch2/$USER/.cache}"
+export HF_HOME="${HF_HOME:-/import/snvm-sc-scratch2/$USER/hf_cache}"
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/import/snvm-sc-scratch2/$USER/pip_cache}"
 
 source "$CONDA/etc/profile.d/conda.sh"
 conda activate agentlego

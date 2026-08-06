@@ -88,9 +88,20 @@ CONDA=/import/snvm-sc-scratch2/$USER/miniforge3        # miniforge, not system c
 source "$CONDA/etc/profile.d/conda.sh"
 
 # Keep caches off $HOME — model/pip caches are large and $HOME is quota'd.
-export HF_HOME=/import/snvm-sc-scratch2/$USER/hf_cache
-export XDG_CACHE_HOME=/import/snvm-sc-scratch2/$USER/.cache
-export PIP_CACHE_DIR=/import/snvm-sc-scratch2/$USER/pip_cache
+# Defer to anything already exported (e.g. a shell rc that already redirects these):
+# an unconditional assignment here would override it, and Qwen-VL-Chat's ~20GB would
+# be downloaded a second time into a redundant tree.
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/import/snvm-sc-scratch2/$USER/.cache}"
+export HF_HOME="${HF_HOME:-/import/snvm-sc-scratch2/$USER/hf_cache}"
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/import/snvm-sc-scratch2/$USER/pip_cache}"
+```
+
+EasyOCR (the `OCR` tool) ignores `XDG_CACHE_HOME` and defaults to `~/.EasyOCR`, i.e.
+**on** the quota — `agentlego/tools/ocr/ocr.py` builds `easyocr.Reader` without a
+`model_storage_directory`, so the env var is the only knob:
+
+```bash
+export EASYOCR_MODULE_PATH="${EASYOCR_MODULE_PATH:-/import/snvm-sc-scratch2/$USER/.cache/EasyOCR}"
 ```
 
 Envs, once built, are `agentlego` (py3.11: torch 2.1.2, mmcv 2.1.0, mmengine,
