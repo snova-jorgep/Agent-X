@@ -192,7 +192,8 @@ def build_models(cfg):
     return model_dicts, manifest
 
 
-def render_eval_config(model_dicts, dataset_dir, limit=0):
+def render_eval_config(model_dicts, dataset_dir, limit=0, max_task_size=50,
+                       size_cache=None):
     """Full source of a generated eval_gta_bench.py with our models + dataset injected.
 
     Two overrides are applied to the imported gta_bench dataset dict:
@@ -203,6 +204,17 @@ def render_eval_config(model_dicts, dataset_dir, limit=0):
       directory (see agentx_options.dataset_dir).
     * ``reader_cfg['test_range']`` — OpenCompass's native row slice ('[:5]' keeps the
       first 5). This is how `limit` is applied: no file is copied or rewritten.
+
+    The infer partitioner takes two injected values:
+
+    * ``max_task_size`` — with gen_task_coef=1 the partitioner's "cost" IS the row
+      count, so this is simply the maximum rows per inference task. Anything >= the
+      post-`limit` row count runs the whole set in a single pass; smaller values
+      shard it into ceil(D/max_task_size) tasks of ceil(D/k) rows each, run
+      concurrently up to --max-num-workers.
+    * ``dataset_size_path`` — a PER-RUN file (see main()). SizePartitioner memoizes
+      the row count keyed on the dataset abbr alone and never refreshes it, so a
+      shared cache goes stale as soon as `limit` or `dataset_dir` changes.
     """
     body = "\n".join(model_dicts)
     limit_line = (f"datasets[0]['reader_cfg']['test_range'] = '[:{int(limit)}]'\n"
@@ -223,7 +235,9 @@ def render_eval_config(model_dicts, dataset_dir, limit=0):
         f"{limit_line}\n"
         f"models = [\n{body}\n]\n\n"
         "infer = dict(\n"
-        "    partitioner=dict(type=SizePartitioner, max_task_size=50, gen_task_coef=1),\n"
+        "    partitioner=dict(type=SizePartitioner,\n"
+        f"        max_task_size={int(max_task_size)}, gen_task_coef=1,\n"
+        f"        dataset_size_path={size_cache!r}),\n"
         "    runner=dict(type=LocalRunner, task=dict(type=OpenICLInferTask)),\n"
         ")\n"
     )
@@ -236,7 +250,8 @@ def mask_config_keys(text):
 
 
 def describe_dataset(dataset_dir, limit):
-    """Report which task set will run. Read-only — nothing is copied or rewritten.
+    """Report which task set will run, and return its row count. Read-only —
+    nothing is copied or rewritten.
 
     GTABenchDataset.load() reads `<dataset_dir>/dataset.json` and resolves each
     task's file paths against that same directory, so a task set is selected by
@@ -252,6 +267,9 @@ def describe_dataset(dataset_dir, limit):
     n = min(total, int(limit)) if limit and int(limit) > 0 else total
     print(f"[DATASET] {dataset_dir.name}: {n} of {total} task(s)"
           f"{'' if n == total else f' (limit={limit})'}")
+    # Returned so consolidate_predictions() can flag a shard that died without
+    # producing its final prediction file (see its `expected` argument).
+    return n
 
 
 def latest_output_dir(newer_than=None):
@@ -318,8 +336,17 @@ def _extract_final_answer(prediction):
     return _clean_answer(answer) if answer else ""
 
 
-def consolidate_predictions(work_dir, abbr, dest, gt_path=None):
+def consolidate_predictions(work_dir, abbr, dest, gt_path=None, expected=None):
     """Convert OpenCompass predictions for one model into the judge's format.
+
+    `expected` (the post-`limit` row count from describe_dataset) is compared
+    against the number of tasks actually consolidated. It matters for SHARDED
+    runs: if one shard dies mid-way it leaves tmp_Agent-X_2.json while its
+    siblings leave final Agent-X_0/1.json, and the `final_files or files`
+    preference below then drops the partial shard silently — yielding a
+    plausible-looking score sheet averaged over a subset of the dataset. Nothing
+    else in the pipeline compares the consolidated count against what was asked
+    for, so without this the undercount is invisible.
 
     The judge (evaluation/run_eval_gpt_as_judge.py) expects `--pred_path` to be a
     JSON list where each element is {task_id: {"reasoning_steps": ...,
@@ -409,6 +436,13 @@ def consolidate_predictions(work_dir, abbr, dest, gt_path=None):
                 "dataset_dir and ground_truth are out of sync."
             )
 
+    if expected and len(merged) != expected:
+        print(f"[WARN] {abbr}: consolidated {len(merged)} of {expected} expected "
+              f"task(s) from {[p.name for p in use_files]}. A shard likely failed "
+              "before writing its final prediction file — any scores below are "
+              "averaged over a SUBSET of the dataset and are not comparable to a "
+              "complete run.")
+
     pred_list = [{k: v} for k, v in merged.items()]
     with open(dest, "w") as f:
         json.dump(pred_list, f, indent=2)
@@ -495,16 +529,34 @@ def main():
     # Which task set to infer over: a directory holding dataset.json + the image/
     # it references. NOT the judge ground_truth (data.json) — different schema.
     dataset_dir = opts.get("dataset_dir", "data/agentx_dataset")
-    describe_dataset(OPENCOMPASS_DIR / dataset_dir, limit)
+    expected_tasks = describe_dataset(OPENCOMPASS_DIR / dataset_dir, limit)
+
+    # Rows per inference task. gen_task_coef=1 makes the partitioner's cost the
+    # row count itself, so >= expected_tasks is a single pass over the whole set
+    # and anything smaller shards it (102 rows at 50 -> 3 tasks of 34).
+    max_task_size = opts.get("max_task_size", 50)
+    # Per-run partitioner size cache. SizePartitioner memoizes the row count keyed
+    # on the dataset abbr ALONE — 'Agent-X' for every task set, whatever the
+    # dataset_dir — and on a hit returns before ever re-measuring. Worse, what it
+    # stores is the size AFTER reader_cfg['test_range'] was applied, then applies
+    # test_range to that value again on read. So a shared cache written by a
+    # `limit: 5` smoke test reports size 5 forever: 5 <= max_task_size, sharding
+    # silently switches off, and the whole set runs as one task no matter what
+    # limit or dataset_dir say. Scoping the file to a single run keeps the
+    # within-run memoization (get_cost is called several times per model) and
+    # drops the cross-run staleness entirely. Removed in the finally below.
+    size_cache = f".cache/dataset_size_{run_timestamp}.json"
 
     backup = EVAL_CONFIG.with_suffix(".py.suite-bak")
     if dry_run:
         print(f"\n[DRY-RUN] Would back up {EVAL_CONFIG} -> {backup}")
         print("[DRY-RUN] Would write generated config (API keys masked):\n")
-        print(mask_config_keys(render_eval_config(model_dicts, dataset_dir, limit)))
+        print(mask_config_keys(render_eval_config(
+            model_dicts, dataset_dir, limit, max_task_size, size_cache)))
     else:
         shutil.copy2(EVAL_CONFIG, backup)
-        EVAL_CONFIG.write_text(render_eval_config(model_dicts, dataset_dir, limit))
+        EVAL_CONFIG.write_text(render_eval_config(
+            model_dicts, dataset_dir, limit, max_task_size, size_cache))
         print(f"[OK] Injected {len(manifest)} model(s) into {EVAL_CONFIG}")
 
     try:
@@ -550,7 +602,8 @@ def main():
             try:
                 consolidate_predictions(
                     work_dir, m["abbr"], preds_path,
-                    gt_path=OPENCOMPASS_DIR / opts["ground_truth"])
+                    gt_path=OPENCOMPASS_DIR / opts["ground_truth"],
+                    expected=expected_tasks)
             except Exception as e:
                 print(f"[WARN] {m['provider']}/{m['alias']} prediction consolidation "
                       f"failed: {e}")
@@ -588,6 +641,10 @@ def main():
         if not dry_run and backup.exists():
             shutil.move(str(backup), str(EVAL_CONFIG))
             print(f"[OK] Restored original {EVAL_CONFIG}")
+        # The size cache is per-run by design; leaving it behind would recreate
+        # exactly the staleness it exists to avoid.
+        if not dry_run:
+            (OPENCOMPASS_DIR / size_cache).unlink(missing_ok=True)
 
     if not dry_run and run_eval:
         generate_report(str(output_base), s3_prefix)

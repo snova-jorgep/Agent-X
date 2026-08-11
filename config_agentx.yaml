@@ -44,6 +44,15 @@ agentx_options:
 
   max_num_workers: 8
   limit: 102           # 0 = full 828 tasks; small N = smoke test
+  # Max rows per inference task. gen_task_coef=1 makes OpenCompass's partitioner
+  # "cost" the row count itself, so this is a plain row cap: >= the post-`limit`
+  # row count runs everything in ONE task, smaller values shard into
+  # ceil(D/max_task_size) tasks of ceil(D/k) rows, run concurrently up to
+  # max_num_workers. At limit=102: 50 -> 3 tasks of 34; 102 -> a single pass.
+  # Sharding cuts wall clock but multiplies the request rate against the provider
+  # (each task carries its own query_per_second) and the load on the one CPU
+  # AgentLego tool server, so the speedup is well short of linear.
+  max_task_size: 50
   debug: false        # true = OpenCompass sequential in-process (aborts batch on 1st model error); false = isolated tasks, resilient
   request_timeout: 300  # per-request seconds; a stalled provider errors+retries instead of hanging the run forever
 
