@@ -7,7 +7,7 @@ agentx_options:
   # "data/cpu_runnable" = the 102-task CPU-runnable subset. Switching task sets
   # is just this one line.
   # "data/gpu_runnable" is another option
-  dataset_dir: "data/gpu_runnable"
+  dataset_dir: "data/cpu_runnable"
   ground_truth: "data/agentx_dataset/data.json"      # judge --gt_data_path
   tool_meta: "data/agentx_dataset/toolmeta.json"
 
