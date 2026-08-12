@@ -34,6 +34,14 @@ from datetime import datetime
 import yaml
 from dotenv import load_dotenv
 
+# <repo-root> for config_env, so this works when run from another directory.
+sys.path.append(str(Path(__file__).resolve().parent))
+
+from config_env import (  # noqa: E402
+    config_env_from_argv,
+    resolve_config_env,
+    write_sidecar,
+)
 from agentx_report import generate_report
 
 CONFIG_FILENAME = "config_agentx.yaml"
@@ -497,6 +505,7 @@ def summarize_predictions(preds_path):
 
 
 def main():
+    cli_config_env = config_env_from_argv()
     dry_run = "--dry-run" in sys.argv
 
     load_env()
@@ -507,10 +516,19 @@ def main():
     judge = opts.get("judge", "gpt")
     run_eval = opts.get("run_eval", True)
 
+    config_env = resolve_config_env(cli_config_env, cfg)
+    print(f"[INFO] config_env: {config_env}")
+
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_base = current_dir / "logs" / BENCH_GROUP_NAME / run_timestamp
     output_base.mkdir(parents=True, exist_ok=True)
     s3_prefix = f"fc-so-testing-suite/agentx_snova/{run_timestamp}"
+
+    # Written BEFORE the work: inference and judging are separate stages, and with
+    # agentx_options.run_eval=false the report is skipped entirely and run by hand
+    # later. Either way the sidecar is how that later run recovers this id.
+    if not dry_run:
+        write_sidecar(output_base, config_env, cfg.get("base_urls", {}))
 
     print(f"[INFO] Local output: {output_base}")
     print(f"[INFO] S3 prefix:   s3://{os.getenv('AWS_S3_BUCKET_NAME')}/{s3_prefix}\n")
@@ -647,7 +665,7 @@ def main():
             (OPENCOMPASS_DIR / size_cache).unlink(missing_ok=True)
 
     if not dry_run and run_eval:
-        generate_report(str(output_base), s3_prefix)
+        generate_report(str(output_base), s3_prefix, config_env=config_env)
 
     print(f"\n[COMPLETE] Agent-X run finished.\nLocal: {output_base}"
           f"\nS3:    s3://{os.getenv('AWS_S3_BUCKET_NAME')}/{s3_prefix}")

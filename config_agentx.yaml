@@ -1,6 +1,10 @@
 # Agent-X: vision-centric agentic tool-use benchmark. Models MUST be multimodal.
 # See AGENTX_SETUP.md for setup and run flow.
 
+# Which deployment this run targets. Ids are defined in <suite-root>/config_envs.yaml.
+# Override for a one-off run with --config-env <id> instead of editing this.
+config_env: cloud-prod
+
 agentx_options:
   # Task set to infer over: a directory holding dataset.json + the image/ it
   # references. "data/agentx_dataset" = the full 828 (see AGENTX_SETUP.md §2);
