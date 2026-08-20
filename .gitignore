@@ -22,3 +22,6 @@ opencompass/src/
 # submodule, so the parent repo's .gitignore does NOT cover it — the entry has
 # to live here.
 venv_agentx_judge/
+
+# Local-only experiment tracking report (not for commit).
+AGENTX_EXPERIMENT_VALIDITY_REPORT.md
