@@ -23,6 +23,17 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 
+# <repo-root> for config_env, so this works when run from another directory.
+sys.path.append(str(Path(__file__).resolve().parent))
+
+from config_env import (  # noqa: E402
+    config_env_from_argv,
+    internal_providers_from,
+    read_sidecar,
+    resolve_config_env,
+    row_config_env,
+)
+
 # raw judge key -> clean CSV/Athena column name (order defines CSV column order).
 METRICS = [
     ("grounding_accuracy", "grounding_accuracy"),
@@ -145,8 +156,19 @@ def _upload_to_s3(local_path, s3_prefix):
         print(f"[WARN] Upload failed for {local_path}: {e}")
 
 
-def generate_report(logs_dir, s3_prefix=None):
+def generate_report(logs_dir, s3_prefix=None, config_env=None):
     logs_path = Path(logs_dir)
+
+    # Invoked standalone against an existing run dir there is no flag, so fall back to
+    # the sidecar written at generation time, then to the registry default. This path
+    # matters here: with agentx_options.run_eval=false the runner skips the report
+    # entirely, so it is commonly run by hand afterwards.
+    if config_env is None:
+        config_env = read_sidecar(logs_path)
+    config_env = resolve_config_env(config_env, None)
+    internal_providers = internal_providers_from(None)
+    print(f"[REPORT] config_env: {config_env}")
+
     rows = []
 
     for provider_dir in sorted(p for p in logs_path.iterdir() if p.is_dir()):
@@ -168,6 +190,8 @@ def generate_report(logs_dir, s3_prefix=None):
                 "model": model,
                 "num_tasks": num_tasks,
                 **means,
+                # Must stay LAST: the Athena regex expects config_env trailing.
+                "config_env": row_config_env(config_env, provider, internal_providers),
             }
             rows.append(row)
             print(f"  {provider}/{model}: {num_tasks} tasks | "
@@ -189,7 +213,8 @@ def generate_report(logs_dir, s3_prefix=None):
               "rows; re-run the short-changed providers (raise retry / "
               "request_timeout) for an apples-to-apples comparison.")
 
-    fieldnames = ["date", "provider", "model", "num_tasks"] + CLEAN_COLS
+    # config_env last: DictWriter takes column order from fieldnames, not row keys.
+    fieldnames = ["date", "provider", "model", "num_tasks"] + CLEAN_COLS + ["config_env"]
     timestamp = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     csv_path = logs_path / f"results_{timestamp}.csv"
     with open(csv_path, "w", newline="") as f:
@@ -204,8 +229,13 @@ def generate_report(logs_dir, s3_prefix=None):
 
 
 if __name__ == "__main__":
+    cli_config_env = config_env_from_argv()
     if len(sys.argv) < 2:
-        print("Usage: agentx_report.py <logs_dir> [s3_prefix]")
+        print("Usage: agentx_report.py <logs_dir> [s3_prefix] [--config-env <id>]")
         sys.exit(1)
     _load_env()
-    generate_report(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
+    generate_report(
+        sys.argv[1],
+        sys.argv[2] if len(sys.argv) > 2 else None,
+        config_env=cli_config_env,
+    )

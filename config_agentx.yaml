@@ -1,6 +1,10 @@
 # Agent-X: vision-centric agentic tool-use benchmark. Models MUST be multimodal.
 # See AGENTX_SETUP.md for setup and run flow.
 
+# Which deployment this run targets. Ids are defined in <suite-root>/config_envs.yaml.
+# Override for a one-off run with --config-env <id> instead of editing this.
+config_env: cloud-prod
+
 agentx_options:
   # Task set to infer over: a directory holding dataset.json + the image/ it
   # references. "data/agentx_dataset" = the full 828 (see AGENTX_SETUP.md §2);
@@ -43,7 +47,16 @@ agentx_options:
     - "\nResponse"
 
   max_num_workers: 8
-  limit: 3             # smoke first; set 0 (=all 102 in cpu_runnable) for the full run
+  limit: 102           # 0 = full 828 tasks; small N = smoke test
+  # Max rows per inference task. gen_task_coef=1 makes OpenCompass's partitioner
+  # "cost" the row count itself, so this is a plain row cap: >= the post-`limit`
+  # row count runs everything in ONE task, smaller values shard into
+  # ceil(D/max_task_size) tasks of ceil(D/k) rows, run concurrently up to
+  # max_num_workers. At limit=102: 50 -> 3 tasks of 34; 102 -> a single pass.
+  # Sharding cuts wall clock but multiplies the request rate against the provider
+  # (each task carries its own query_per_second) and the load on the one CPU
+  # AgentLego tool server, so the speedup is well short of linear.
+  max_task_size: 50
   debug: false        # true = OpenCompass sequential in-process (aborts batch on 1st model error); false = isolated tasks, resilient
   request_timeout: 1200  # per-request seconds; a stalled provider errors+retries instead of hanging the run forever. Together's gemma-4-31B routinely exceeded 300s, aborting shards.
   # Retries per request before the task (and its whole OpenCompass shard) aborts.
