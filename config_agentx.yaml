@@ -58,10 +58,16 @@ agentx_options:
   # AgentLego tool server, so the speedup is well short of linear.
   max_task_size: 50
   debug: false        # true = OpenCompass sequential in-process (aborts batch on 1st model error); false = isolated tasks, resilient
-  request_timeout: 300  # per-request seconds; a stalled provider errors+retries instead of hanging the run forever
+  request_timeout: 1200  # per-request seconds; a stalled provider errors+retries instead of hanging the run forever. Together's gemma-4-31B routinely exceeded 300s, aborting shards.
+  # Retries per request before the task (and its whole OpenCompass shard) aborts.
+  # Raised from the OpenCompass default of 2: capacity 429s (Cerebras
+  # queue_exceeded, now backed-off in openai_api.py) and slow endpoints (Together)
+  # need headroom so one transient failure doesn't discard the rest of the shard.
+  retry: 10
 
+  temperature: 0      # deterministic model decoding (wrapper default is 0.7)
   judge: gpt          # gpt | qwen
-  run_eval: true      # false = infer only (no judge key needed)
+  run_eval: true     # infer-only smoke (no judge); flip to true for scores
   judge_python: ".venv_agentx_judge/bin/python"  # judge needs openai==0.28.0, isolated venv
 
 max_parallel: 1       # OpenCompass parallelizes across models internally
@@ -80,7 +86,7 @@ base_urls:
 # and a ReAct task issues up to `max_turn` requests, so it needs 5/60 = 0.083 qps
 # with headroom. Omit a provider to use the global default.
 provider_query_per_second:
-  Cerebras: 0.07
+  Cerebras: 0.05
 
 provider_api_keys:
   SambaNova: SAMBANOVA_API_KEY
@@ -105,10 +111,10 @@ model_mappings:
     Gemma-4-31B:                         "not_available"
   Cerebras:
   #   Llama-4-Maverick-17B-128E-Instruct: "not_available"
-    Gemma-4-31B:                         "gemma-4-31b"
+    Gemma-4-31B:                         "gemma-4-31b"          # verified in live Cerebras /v1/models
   Together:
   #   Llama-4-Maverick-17B-128E-Instruct: "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"
-    Gemma-4-31B:                         "google/gemma-4-31B-it"
+    Gemma-4-31B:                         "google/gemma-4-31B-it"  # verified in live Together /v1/models (capital B)
   Novita:
   #   Llama-4-Maverick-17B-128E-Instruct: "meta-llama/llama-4-maverick-17b-128e-instruct-fp8"
-    Gemma-4-31B:                         "google/gemma-4-31b-it"
+    Gemma-4-31B:                         "google/gemma-4-31b-it"  # verified in live Novita /v1/models (lowercase b)

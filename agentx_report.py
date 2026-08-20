@@ -108,18 +108,33 @@ def average_scores(scores_path):
 
     sums = {raw: 0.0 for raw, _ in METRICS}
     counts = {raw: 0 for raw, _ in METRICS}
+    ungradeable = {raw: 0 for raw, _ in METRICS}
     for _task, metrics in data.items():
         if not isinstance(metrics, dict):
             continue
         for raw, _clean in METRICS:
+            # Distinguish "judge never emitted this metric" (truly absent -> skip)
+            # from "judge emitted something we can't grade" (a refusal like
+            # "I'm sorry, but..." or a dumped ```python analysis with no Score).
+            # The latter used to return None and get skipped, silently shrinking
+            # this metric's denominator below num_tasks and inflating the mean by
+            # dropping exactly the hardest tasks. Count it as 0.0 instead, so the
+            # denominator matches num_tasks and the miss is visible.
+            if raw not in metrics or metrics[raw] is None:
+                continue
             score = _extract_score(metrics.get(raw))
-            if score is not None:
-                sums[raw] += score
-                counts[raw] += 1
+            if score is None:
+                score = 0.0
+                ungradeable[raw] += 1
+            sums[raw] += score
+            counts[raw] += 1
 
     means = {}
     for raw, clean in METRICS:
         means[clean] = round(sums[raw] / counts[raw], 4) if counts[raw] else None
+    dropped = {clean: ungradeable[raw] for raw, clean in METRICS if ungradeable[raw]}
+    if dropped:
+        print(f"  [denominator] ungradeable judge outputs counted as 0.0: {dropped}")
     return means, len(data)
 
 
@@ -185,6 +200,18 @@ def generate_report(logs_dir, s3_prefix=None, config_env=None):
     if not rows:
         print("[WARN] No results found in", logs_dir)
         return None
+
+    # Rows are only comparable when every provider scored the same task set. A
+    # provider whose shards partly failed contributes fewer tasks (see the
+    # consolidate_predictions shard-merge note); comparing e.g. 34 vs 68 vs 102
+    # tasks as if equal is the trap this guards against.
+    counts_by_provider = sorted((r["num_tasks"], f"{r['provider']}/{r['model']}")
+                                for r in rows)
+    if len({c for c, _ in counts_by_provider}) > 1:
+        print("[WARN] Providers scored DIFFERENT numbers of tasks "
+              f"{counts_by_provider}. Metrics are NOT directly comparable across "
+              "rows; re-run the short-changed providers (raise retry / "
+              "request_timeout) for an apples-to-apples comparison.")
 
     # config_env last: DictWriter takes column order from fieldnames, not row keys.
     fieldnames = ["date", "provider", "model", "num_tasks"] + CLEAN_COLS + ["config_env"]

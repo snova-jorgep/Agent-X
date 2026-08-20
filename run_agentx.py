@@ -178,11 +178,21 @@ def build_models(cfg):
                 f"            query_per_second={qps},\n"
                 f"            max_seq_len={int(opts.get('max_seq_len', 4096))},\n"
                 f"            timeout={int(opts.get('request_timeout', 300))},\n"
+                # Retries per request before the task (and its whole shard) aborts.
+                # OpenCompass defaults to 2; capacity 429s (Cerebras queue_exceeded)
+                # and slow endpoints (Together 300s timeouts) need more headroom so
+                # a single transient failure doesn't discard the rest of the shard.
+                f"            retry={int(opts.get('retry', 2))},\n"
                 # Lands in OpenAI.gen_params -> merged over the request payload,
                 # overriding opencompass's 512 default. Reasoning-capable gemma-4
                 # endpoints (Together, Novita) spend the whole budget on
                 # `reasoning` and return content='' if this is left at 512.
                 f"            max_tokens={int(opts.get('max_out_len', 2048))},\n"
+                # Decoding temperature. The OpenAI wrapper's generate() default is
+                # 0.7, which makes every run stochastic, unseeded and single-sample
+                # (n=1) -> provider deltas can sit inside run-to-run noise and
+                # nothing is reproducible. Pin to 0 for a defensible comparison.
+                f"            temperature={float(opts.get('temperature', 0.0))},\n"
                 + (f"            stop={stop!r},\n" if stop else "")
                 + "        ),\n"
                 # ReActProtocolFixed pairs each Action with its OWN Action Input
@@ -384,10 +394,27 @@ def consolidate_predictions(work_dir, abbr, dest, gt_path=None, expected=None):
             f"No predictions dir for {abbr} at {pred_dir}. Did inference run/finish?"
         )
 
-    # Prefer the completed Agent-X.json over any tmp_ partial file.
+    # Merge every shard, preferring a shard's COMPLETED file over its tmp_
+    # partial. OpenCompass shards the dataset (SizePartitioner) and aborts a
+    # whole shard the moment one request exhausts its retries, leaving
+    # tmp_Agent-X_<i>.json holding the tasks that shard DID finish. Those are
+    # valid predictions and must not be thrown away just because a *sibling*
+    # shard happened to complete. The previous `final_files or files` did
+    # exactly that: any completed shard made the run ignore every tmp_ partial,
+    # so a run with one good shard + two aborted shards reported only the good
+    # shard's tasks (e.g. Together 34 of 86, Novita 68 of 97) with no warning.
+    # Group by shard stem (tmp_Agent-X_0 and Agent-X_0 are the same shard),
+    # prefer the non-tmp file per shard, then merge across shards. The task_id
+    # dedup below still guards against a genuine cross-shard collision.
     files = sorted(pred_dir.glob("*.json"))
-    final_files = [f for f in files if not f.name.startswith("tmp_")]
-    use_files = final_files or files
+    by_shard = {}
+    for f in files:
+        stem = f.name[len("tmp_"):] if f.name.startswith("tmp_") else f.name
+        prev = by_shard.get(stem)
+        if prev is None or (not f.name.startswith("tmp_")
+                            and prev.name.startswith("tmp_")):
+            by_shard[stem] = f
+    use_files = sorted(by_shard.values())
 
     merged = {}
     legacy_keyed = 0

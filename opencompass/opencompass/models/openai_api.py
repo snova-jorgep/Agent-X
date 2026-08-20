@@ -787,7 +787,13 @@ class OpenAI(BaseAPIModel):
                     response if 'message' in response else None)
                 if err is not None:
                     code = err.get('code') if isinstance(err, dict) else None
-                    if code in ('rate_limit_exceeded', 'request_quota_exceeded'):
+                    # 'queue_exceeded' is Cerebras' capacity/high-traffic 429
+                    # (type 'too_many_requests_error'); like the rate-limit codes
+                    # it is transient and MUST back off. Without it here the 429
+                    # fell through to a plain retry with NO sleep, burning both
+                    # retries back-to-back and aborting the whole shard instantly.
+                    if code in ('rate_limit_exceeded', 'request_quota_exceeded',
+                                'queue_exceeded'):
                         # Cerebras allows as few as 5 req/min; 1s is not enough
                         # to clear a per-minute window, so back off properly.
                         backoff = 5 * (max_num_retries + 1)

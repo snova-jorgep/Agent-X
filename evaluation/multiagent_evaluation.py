@@ -48,6 +48,8 @@ def get_grounding_score(target,pred):
 
     response = openai.ChatCompletion.create(
     model=gpt_judge,
+    temperature=0,
+    seed=0,
     messages=[
         {"role": "system", "content": evaluation_prompt},
         {"role": "user", "content": "GT: " + target + "\n" + "agent's reasoning steps: " + pred}
@@ -89,6 +91,8 @@ def get_precision_score(GT, pred):
 
     response = openai.ChatCompletion.create(
     model=gpt_judge,
+    temperature=0,
+    seed=0,
     messages=[
         {"role": "system", "content": evaluation_prompt},
         {"role": "user", "content": "GT: " + GT + "\n" + "agent's reasoning trace: " + pred}
@@ -129,6 +133,8 @@ def get_tool_accuray(tool_metadata, reasoning_steps):
 
     response = openai.ChatCompletion.create(
     model=gpt_judge,
+    temperature=0,
+    seed=0,
     messages=[
         {"role": "system", "content": tool_accuracy_prompt},
         # {"role": "user", "content": "tool metadata: " + tool_metadata + "\n" + "tool output: " + tool_output + "\n" + "task goal: " + task_goal}
@@ -167,6 +173,8 @@ def get_faithfulness_accuray(GT, reasoning_steps):
 
     response = openai.ChatCompletion.create(
     model=gpt_judge,
+    temperature=0,
+    seed=0,
     messages=[
         {"role": "system", "content": faithfulness_accuracy_prompt},
         {"role": "user", "content": "GT: " + GT + "\n" + "agent's reasoning trace: " + reasoning_steps}
@@ -212,6 +220,8 @@ def get_goal_accuray(GT, query_type, final_answer):
 
     response = openai.ChatCompletion.create(
     model=gpt_judge,
+    temperature=0,
+    seed=0,
     messages=[
         {"role": "system", "content": goal_accuracy_prompt},
         {"role": "user", "content": "GT answer: " + GT + "\n" + "query_type: " + query_type + "\n" + "agent's final answer: " + final_answer}
@@ -246,6 +256,8 @@ def get_toolset_accuray(GT, reasoning_steps):
 
     response = openai.ChatCompletion.create(
     model=gpt_judge,
+    temperature=0,
+    seed=0,
     messages=[
         {"role": "system", "content": toolset_accuracy_prompt},
         {"role": "user", "content": "GT: " + GT + "\n" + "agent's reasoning steps: " + reasoning_steps}
@@ -283,6 +295,8 @@ def get_step_score(reasoning_step):
 
     response = openai.ChatCompletion.create(
     model=gpt_judge,
+    temperature=0,
+    seed=0,
     messages=[
         {"role": "system", "content": step_score_prompt},
         {"role": "user", "content": "agent's reasoning step: " + reasoning_step}
@@ -333,6 +347,8 @@ def get_context_score(GT, reasoning_steps):
 
     response = openai.ChatCompletion.create(
     model=gpt_judge,
+    temperature=0,
+    seed=0,
     messages=[
         {"role": "system", "content": context_score_prompt},
         {"role": "user", "content": "GT: " + GT + "\n" + "agent's reasoning_steps: " + reasoning_steps}
@@ -369,6 +385,8 @@ def get_clarity_penalty(reasoning_trace):
 
     response = openai.ChatCompletion.create(
     model=gpt_judge,
+    temperature=0,
+    seed=0,
     messages=[
         {"role": "system", "content": clarity_penalty_prompt},
         {"role": "user", "content": "agent's reasoning trace: " + reasoning_trace}
@@ -408,6 +426,8 @@ def get_factual_precision(GT, reasoning_steps):
 
     response = openai.ChatCompletion.create(
     model=gpt_judge,
+    temperature=0,
+    seed=0,
     messages=[
         {"role": "system", "content": factual_accuracy_prompt},
         {"role": "user", "content": "GT: " + GT + "\n" + "agent's reasoning steps: " + reasoning_steps}
@@ -446,6 +466,8 @@ def get_semantic_accuracy(GT, reasoning_steps, final_answer):
 
     response = openai.ChatCompletion.create(
     model=gpt_judge,
+    temperature=0,
+    seed=0,
     messages=[
         {"role": "system", "content": semantic_accuracy_prompt},
         {"role": "user", "content": "GT: " + GT + "\n" + "agent's reasoning steps: " + reasoning_steps + "\n" + "agent's final answer: " + final_answer}
@@ -475,6 +497,8 @@ def get_coherence_accuracy(reasoning_steps):
 
     response = openai.ChatCompletion.create(
     model=gpt_judge,
+    temperature=0,
+    seed=0,
     messages=[
         {"role": "system", "content": instruct_prompt},
         {"role": "user", "content": "agent's reasoning trace: " + reasoning_steps}
@@ -513,6 +537,8 @@ def get_reward_score(query, reasoning_steps):
 
     response = openai.ChatCompletion.create(
     model=gpt_judge,
+    temperature=0,
+    seed=0,
     messages=[
         {"role": "system", "content": reward_score_prompt},
         {"role": "user", "content": "query: " + query + "\n" + "agent's reasoning trace: " + reasoning_steps}
