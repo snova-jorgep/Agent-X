@@ -31,7 +31,7 @@ agentx_options:
   # Per-request max_tokens. Overrides opencompass's 512 default: reasoning-capable
   # gemma-4 endpoints (Together, Novita) emit a separate `reasoning` field and
   # return content='' if the budget runs out before the answer starts.
-  max_out_len: 1024
+  max_out_len: 2048
   # ReAct turn boundary — REQUIRED, and not a model-family EOS token.
   # ReAct is a plain-text protocol: the model is supposed to stop after
   # `Action Input:` and let the harness run the tool and supply `Response:`.
