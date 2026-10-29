@@ -2,7 +2,8 @@
 
 Walks logs/agentx/<ts>/{provider}/{model}/scores.json (produced by the judge in
 run_agentx.py), averages the 12 per-task metrics into a single row per model, and
-writes one CSV matching the `agentx_results` Athena table in data_prep_athena.py.
+writes one CSV matching the `agentx_results` Athena table, defined in the shared
+athena_data_prep repo (projects/fcso/tables/agentx_results.yaml).
 
 The judge (evaluation/run_eval_gpt_as_judge.py) emits, per task key:
     {grounding_accuracy, precision_score, tool_accuray, faithfulness_accuray,
